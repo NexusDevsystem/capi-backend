@@ -13,6 +13,7 @@ import { Supplier } from './models/Supplier.js';
 import { CashClosing } from './models/CashClosing.js';
 import { BankAccount } from './models/BankAccount.js';
 import { StoreUser } from './models/StoreUser.js';
+import { authMiddleware, generateToken } from './middleware/auth.js';
 
 dotenv.config();
 
@@ -23,11 +24,6 @@ if (!globalThis.fetch) {
 
 const app = express();
 const port = 3001;
-
-// --- CONFIGURAÇÃO ABACATE PAY (DEPRECATED - Migrating to CAKTO) ---
-// Chave atualizada conforme solicitação
-const ABACATE_API_TOKEN = "abc_dev_NARbx1crmcnReLfW31zws3RS";
-const ABACATE_BASE_URL = "https://api.abacatepay.com/v1";
 
 // --- CONFIGURAÇÃO CAKTO (NEW PAYMENT GATEWAY) ---
 const CAKTO_CLIENT_ID = process.env.CAKTO_CLIENT_ID;
@@ -127,7 +123,10 @@ app.post('/api/users', async (req, res) => {
         });
         await newUser.save();
 
-        res.status(201).json({ status: 'success', data: newUser });
+        const userResponse = newUser.toObject();
+        delete userResponse.password;
+
+        res.status(201).json({ status: 'success', data: userResponse });
     } catch (error) {
         console.error('Erro ao criar usuário:', error);
         res.status(500).json({ status: 'error', message: 'Erro ao criar usuário.' });
@@ -153,18 +152,28 @@ app.post('/api/login', async (req, res) => {
             }
         }
 
-        res.json({ status: 'success', data: user });
+        const userResponse = user.toObject();
+        delete userResponse.password;
+
+        const token = generateToken(user);
+
+        res.json({ status: 'success', data: { ...userResponse, token } });
     } catch (error) {
         console.error('Erro no login:', error);
         res.status(500).json({ status: 'error', message: 'Erro interno no login.' });
     }
 });
 
-// Atualizar Usuário (Genérico)
-app.put('/api/users/:id', async (req, res) => {
+// Atualizar Usuário (Genérico) - PROTECTED
+app.put('/api/users/:id', authMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
         const updates = req.body;
+
+        // AUTH CHECK: Ensure user is updating themselves or is admin
+        if (req.user.id !== id && req.user.role !== 'admin') {
+            return res.status(403).json({ status: 'error', message: 'Sem permissão para alterar este usuário.' });
+        }
 
         // SECURITY: Block direct updates to sensitive fields
         const blockedFields = ['subscriptionStatus', 'trialEndsAt', 'nextBillingAt', 'invoices'];
@@ -181,6 +190,45 @@ app.put('/api/users/:id', async (req, res) => {
         res.json({ status: 'success', data: user });
     } catch (error) {
         res.status(500).json({ status: 'error', message: 'Erro ao atualizar usuário.' });
+    }
+});
+
+// Switch Active Store - PROTECTED
+app.put('/api/users/:userId/active-store', authMiddleware, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { storeId } = req.body;
+
+        if (req.user.id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized action' });
+        }
+
+        if (!storeId) {
+            return res.status(400).json({ status: 'error', message: 'Store ID required' });
+        }
+
+        // Verify if user is member of this store
+        const membership = await StoreUser.findOne({ userId, storeId });
+        if (!membership) {
+            return res.status(403).json({ status: 'error', message: 'User is not a member of this store' });
+        }
+
+        // Update active store
+        const user = await User.findByIdAndUpdate(userId, { storeId }, { new: true });
+
+        if (!user) {
+            return res.status(404).json({ status: 'error', message: 'User not found' });
+        }
+
+        // Return updated user data formatted for frontend session
+        res.json({
+            status: 'success',
+            data: user,
+            message: 'Active store updated'
+        });
+    } catch (error) {
+        console.error('Error switching active store:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to switch active store' });
     }
 });
 
@@ -212,7 +260,274 @@ app.get('/api/stores/:storeId/team', async (req, res) => {
     }
 });
 
-// --- SECURE SUBSCRIPTION ACTIVATION ---
+// --- STORE STATUS MANAGEMENT ---
+
+// Open Store (Manager/Owner only) - PROTECTED
+app.post('/api/stores/:storeId/open', authMiddleware, async (req, res) => {
+    console.log(`[API] OPEN request for store ${req.params.storeId} by user ${req.user.id}`);
+    try {
+        const { storeId } = req.params;
+        const userId = req.user.id; // From Safe Token
+
+        // Check if user has permission (owner or manager)
+        const storeUser = await StoreUser.findOne({
+            storeId,
+            userId,
+            role: { $in: ['owner', 'manager'] }
+        });
+
+        console.log(`[API] Permission check for ${userId} on ${storeId}:`, storeUser ? 'GRANTED' : 'DENIED');
+
+        if (!storeUser) {
+            console.log('[API] Permission Denied');
+            console.log('DEBUG DETAILS:', { storeId, userId, body: req.body });
+            return res.status(403).json({
+                status: 'error',
+                message: `ERRO PERMISSÃO: userId='${userId}', storeId='${storeId}'. Verifique console do servidor.`
+            });
+        }
+
+        const store = await Store.findByIdAndUpdate(
+            storeId,
+            {
+                isOpen: true,
+                lastOpenedAt: new Date(),
+                openedBy: userId
+            },
+            { new: true }
+        );
+
+        console.log(`[API] Store updated:`, store ? `${store.name} isOpen=${store.isOpen}` : 'Not Found');
+
+        if (!store) {
+            return res.status(404).json({ status: 'error', message: 'Loja não encontrada' });
+        }
+
+        res.json({
+            status: 'success',
+            message: 'Loja aberta com sucesso',
+            data: {
+                storeId: store._id,
+                name: store.name,
+                isOpen: store.isOpen,
+                lastOpenedAt: store.lastOpenedAt
+            }
+        });
+    } catch (error) {
+        console.error('Error opening store:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao abrir loja' });
+    }
+});
+
+// Close Store (Manager/Owner only) - PROTECTED
+app.post('/api/stores/:storeId/close', authMiddleware, async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const userId = req.user.id; // From Safe Token
+
+        // Check if user has permission (owner or manager)
+        const storeUser = await StoreUser.findOne({
+            storeId,
+            userId,
+            role: { $in: ['owner', 'manager'] }
+        });
+
+        if (!storeUser) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Apenas proprietários e gerentes podem fechar a loja'
+            });
+        }
+
+        const store = await Store.findByIdAndUpdate(
+            storeId,
+            {
+                isOpen: false,
+                lastClosedAt: new Date(),
+                closedBy: userId
+            },
+            { new: true }
+        );
+
+        if (!store) {
+            return res.status(404).json({ status: 'error', message: 'Loja não encontrada' });
+        }
+
+        res.json({
+            status: 'success',
+            message: 'Loja fechada com sucesso',
+            data: {
+                storeId: store._id,
+                name: store.name,
+                isOpen: store.isOpen,
+                lastClosedAt: store.lastClosedAt
+            }
+        });
+    } catch (error) {
+        console.error('Error closing store:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao fechar loja' });
+    }
+});
+
+// Get Store Status
+app.get('/api/stores/:storeId/status', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+
+        const store = await Store.findById(storeId)
+            .select('name isOpen lastOpenedAt lastClosedAt openedBy closedBy')
+            .populate('openedBy', 'name')
+            .populate('closedBy', 'name');
+
+        if (!store) {
+            return res.status(404).json({ status: 'error', message: 'Loja não encontrada' });
+        }
+
+        res.json({
+            status: 'success',
+            data: {
+                storeId: store._id,
+                name: store.name,
+                isOpen: store.isOpen,
+                lastOpenedAt: store.lastOpenedAt,
+                lastClosedAt: store.lastClosedAt,
+                openedBy: store.openedBy,
+                closedBy: store.closedBy
+            }
+        });
+    } catch (error) {
+        console.error('Error getting store status:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar status da loja' });
+    }
+});
+
+// Get All Stores Status (for user's stores)
+app.get('/api/stores/status/all', async (req, res) => {
+    try {
+        const { userId } = req.query; // In production, get from auth middleware
+
+        // Get all stores where user is owner or manager
+        const storeUsers = await StoreUser.find({
+            userId,
+            role: { $in: ['owner', 'manager'] }
+        }).select('storeId role');
+
+        const storeIds = storeUsers.map(su => su.storeId);
+
+        const stores = await Store.find({ _id: { $in: storeIds } })
+            .select('name isOpen lastOpenedAt lastClosedAt')
+            .lean();
+
+        const storesWithRole = stores.map(store => {
+            const storeUser = storeUsers.find(su => su.storeId.toString() === store._id.toString());
+            return {
+                ...store,
+                userRole: storeUser?.role
+            };
+        });
+
+        res.json({ status: 'success', data: storesWithRole });
+    } catch (error) {
+        console.error('Error getting all stores status:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar status das lojas' });
+    }
+});
+
+// DEBUG: Dump all stores status and StoreUser relations
+app.get('/api/debug/stores-dump', async (req, res) => {
+    try {
+        const stores = await Store.find({}).select('name isOpen _id lastOpenedAt');
+        const storeUsers = await StoreUser.find({});
+        res.json({ stores, storeUsers });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// --- END STORE STATUS MANAGEMENT ---
+
+// Get User Stores with Status - PROTECTED
+app.get('/api/users/:userId/stores', authMiddleware, async (req, res) => {
+    console.log(`[API] Fetching stores for user ${req.params.userId}`);
+    try {
+        const { userId } = req.params;
+
+        if (req.user.id !== userId) return res.status(403).send('Unauthorized');
+
+        // Find all stores where user is a member
+        const storeUsers = await StoreUser.find({ userId }).select('storeId role joinedAt permissions');
+
+        if (!storeUsers || storeUsers.length === 0) {
+            console.log('[API] No stores found for user');
+            return res.json({
+                status: 'success',
+                data: {
+                    stores: [],
+                    activeStoreId: null,
+                    ownedStores: []
+                }
+            });
+        }
+
+        // Get store details with status
+        const storeIds = storeUsers.map(su => su.storeId);
+        const stores = await Store.find({ _id: { $in: storeIds } })
+            .select('name logoUrl isOpen lastOpenedAt lastClosedAt')
+            .lean();
+
+        console.log('[API] Found stores from DB:', stores.map(s => `${s.name} (isOpen: ${s.isOpen})`));
+
+        // Combine store data with user role
+        const userStores = stores.map(store => {
+            const storeUser = storeUsers.find(su => su.storeId.toString() === store._id.toString());
+            return {
+                storeId: store._id.toString(),
+                storeName: store.name,
+                storeLogo: store.logoUrl,
+                role: storeUser?.role || 'seller',
+                joinedAt: storeUser?.joinedAt || new Date().toISOString(),
+                permissions: storeUser?.permissions || [],
+                isOpen: store.isOpen || false,
+                lastOpenedAt: store.lastOpenedAt,
+                lastClosedAt: store.lastClosedAt
+            };
+        });
+
+        console.log('[API] Returning userStores:', userStores.map(s => `${s.storeName}: ${s.isOpen}`));
+
+        // Find owned stores
+        const ownedStores = storeUsers
+            .filter(su => su.role === 'owner')
+            .map(su => su.storeId.toString());
+
+        // Get user preference for active store
+        const user = await User.findById(userId).select('storeId');
+
+        let activeStoreId = user?.storeId;
+
+        // Verify if user still has access to this store
+        const hasAccess = userStores.some(s => s.storeId === activeStoreId);
+
+        if (!activeStoreId || !hasAccess) {
+            // Fallback to first owned store or first available store
+            activeStoreId = ownedStores[0] || (userStores[0]?.storeId);
+        }
+
+        res.json({
+            status: 'success',
+            data: {
+                stores: userStores,
+                activeStoreId,
+                ownedStores
+            }
+        });
+    } catch (error) {
+        console.error('Error fetching user stores:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar lojas do usuário' });
+    }
+});
+
+// --- SECURE SUBSCRIPTION ACTIVATION (CAKTO ONLY) ---
 app.post('/api/users/:id/activate-subscription', async (req, res) => {
     try {
         const { id } = req.params;
@@ -222,81 +537,15 @@ app.post('/api/users/:id/activate-subscription', async (req, res) => {
             return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
         }
 
-        // SECURITY: Verify payment with AbacatePay
-        try {
-            const abacateResponse = await fetch(`${ABACATE_BASE_URL}/billing/list`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${ABACATE_API_TOKEN}`,
-                    'Content-Type': 'application/json'
-                }
-            });
+        // NOTE: This endpoint used to verify with AbacatePay.
+        // Since migration to Cakto, subscription activation should utilize Cakto Webhooks
+        // or a specific manual verification against Cakto API if needed.
 
-            if (!abacateResponse.ok) {
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'Não foi possível verificar o pagamento. Tente novamente.'
-                });
-            }
-
-            const abacateData = await abacateResponse.json();
-
-            // Find user's payments
-            const userPayments = abacateData.data?.filter((bill) => {
-                const emailMatch = bill.customer?.email === user.email ||
-                    bill.customer?.metadata?.email === user.email;
-                return emailMatch;
-            }) || [];
-
-            // Sort by most recent
-            userPayments.sort((a, b) =>
-                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-            );
-
-            // Check if there's a paid bill
-            const hasPaidBill = userPayments.some(bill =>
-                bill.status === 'PAID' || bill.status === 'COMPLETED'
-            );
-
-            if (!hasPaidBill) {
-                return res.status(402).json({
-                    status: 'error',
-                    message: 'Nenhum pagamento confirmado encontrado. Complete o pagamento primeiro.'
-                });
-            }
-
-            // Payment verified! Activate subscription
-            const nextBilling = new Date();
-            nextBilling.setDate(nextBilling.getDate() + 30);
-
-            user.subscriptionStatus = 'ACTIVE';
-            user.trialEndsAt = null;
-            user.nextBillingAt = nextBilling;
-
-            // Add invoice to user's history
-            const latestPayment = userPayments[0];
-            const invoice = {
-                id: latestPayment.id,
-                date: latestPayment.createdAt,
-                amount: latestPayment.amount / 100, // Convert from cents
-                status: 'PAID',
-                method: 'PIX'
-            };
-
-            user.invoices = user.invoices || [];
-            user.invoices.unshift(invoice);
-
-            await user.save();
-
-            res.json({ status: 'success', data: user });
-
-        } catch (abacateError) {
-            console.error('AbacatePay verification error:', abacateError);
-            return res.status(500).json({
-                status: 'error',
-                message: 'Erro ao verificar pagamento com AbacatePay.'
-            });
-        }
+        // For now, blocking direct activation without a valid payment flow.
+        return res.status(400).json({
+            status: 'error',
+            message: 'Ativação direta descontinuada. Use o fluxo de checkout da Cakto.'
+        });
 
     } catch (error) {
         console.error('Subscription activation error:', error);
@@ -389,200 +638,10 @@ app.post('/api/webhooks/cakto', async (req, res) => {
     }
 });
 
-// TEMPORARY: Manual activation endpoint for development (REMOVE IN PRODUCTION)
-app.post('/api/activate-by-email', async (req, res) => {
-    try {
-        const { email } = req.body;
 
-        if (!email) {
-            return res.status(400).json({ status: 'error', message: 'Email é obrigatório' });
-        }
 
-        console.log(`🔧 ATIVAÇÃO MANUAL solicitada para: ${email}`);
 
-        // Buscar usuário
-        const user = await User.findOne({ email });
 
-        if (!user) {
-            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado' });
-        }
-
-        // Verificar se já está ativo
-        if (user.subscriptionStatus === 'ACTIVE') {
-            return res.json({
-                status: 'success',
-                message: 'Assinatura já está ativa',
-                user: { id: user.id, email: user.email, subscriptionStatus: user.subscriptionStatus }
-            });
-        }
-
-        // Ativar assinatura
-        const nextBilling = new Date();
-        nextBilling.setDate(nextBilling.getDate() + 30);
-
-        user.subscriptionStatus = 'ACTIVE';
-        user.trialEndsAt = null;
-        user.nextBillingAt = nextBilling;
-
-        // Adicionar fatura
-        user.invoices = user.invoices || [];
-        user.invoices.unshift({
-            id: `MANUAL-${Date.now()}`,
-            date: new Date(),
-            amount: 49.90,
-            status: 'PAID',
-            method: 'CAKTO'
-        });
-
-        await user.save();
-
-        console.log(`✅ Assinatura ativada manualmente para ${email}`);
-
-        res.json({
-            status: 'success',
-            message: 'Assinatura ativada com sucesso!',
-            user: {
-                id: user.id,
-                email: user.email,
-                subscriptionStatus: user.subscriptionStatus,
-                nextBillingAt: user.nextBillingAt
-            }
-        });
-
-    } catch (error) {
-        console.error('Erro ao ativar manualmente:', error);
-        res.status(500).json({ status: 'error', message: 'Erro ao ativar assinatura' });
-    }
-});
-
-// --- MULTI-STORE ENDPOINTS ---
-
-// Listar todas as lojas de um usuário
-app.get('/api/users/:userId/stores', async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const user = await User.findById(userId);
-
-        if (!user) {
-            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
-        }
-
-        // Return stores array with full details
-        const storesWithDetails = await Promise.all(
-            (user.stores || []).map(async (storeEntry) => {
-                const store = await Store.findById(storeEntry.storeId);
-                return {
-                    ...storeEntry.toObject(),
-                    storeName: store?.name || storeEntry.storeName,
-                    storeLogo: store?.logoUrl || storeEntry.storeLogo
-                };
-            })
-        );
-
-        res.json({
-            status: 'success',
-            data: {
-                stores: storesWithDetails,
-                activeStoreId: user.activeStoreId,
-                ownedStores: user.ownedStores || []
-            }
-        });
-    } catch (error) {
-        console.error('Erro ao listar lojas do usuário:', error);
-        res.status(500).json({ status: 'error', message: 'Erro ao listar lojas.' });
-    }
-});
-
-// Alternar loja ativa
-app.put('/api/users/:userId/active-store', async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const { storeId } = req.body;
-
-        const user = await User.findById(userId);
-        if (!user) {
-            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
-        }
-
-        // Verify user has access to this store
-        const hasAccess = user.stores?.some(s => s.storeId === storeId);
-        if (!hasAccess) {
-            return res.status(403).json({ status: 'error', message: 'Você não tem acesso a esta loja.' });
-        }
-
-        user.activeStoreId = storeId;
-        await user.save();
-
-        res.json({ status: 'success', data: user });
-    } catch (error) {
-        console.error('Erro ao alternar loja:', error);
-        res.status(500).json({ status: 'error', message: 'Erro ao alternar loja.' });
-    }
-});
-
-// Convidar usuário para loja
-app.post('/api/stores/:storeId/invite', async (req, res) => {
-    try {
-        const { storeId } = req.params;
-        const { email, role, invitedBy } = req.body;
-
-        // Verify store exists
-        const store = await Store.findById(storeId);
-        if (!store) {
-            return res.status(404).json({ status: 'error', message: 'Loja não encontrada.' });
-        }
-
-        // Find user by email
-        const user = await User.findOne({ email });
-        if (!user) {
-            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado com este email.' });
-        }
-
-        // Check if user already has access to this store
-        const alreadyHasAccess = user.stores?.some(s => s.storeId === storeId);
-        if (alreadyHasAccess) {
-            return res.status(400).json({ status: 'error', message: 'Usuário já tem acesso a esta loja.' });
-        }
-
-        // Add store to user's stores array
-        const newStoreEntry = {
-            storeId: storeId,
-            storeName: store.name,
-            storeLogo: store.logoUrl,
-            role: role || 'seller',
-            joinedAt: new Date(),
-            permissions: []
-        };
-
-        user.stores = user.stores || [];
-        user.stores.push(newStoreEntry);
-
-        // Set as active store if user has no active store
-        if (!user.activeStoreId) {
-            user.activeStoreId = storeId;
-        }
-
-        // Update status to active
-        user.status = 'Ativo';
-
-        await user.save();
-
-        // Create StoreUser junction record
-        const storeUser = new StoreUser({
-            userId: user.id,
-            storeId: storeId,
-            role: role || 'seller',
-            invitedBy: invitedBy,
-            permissions: []
-        });
-        await storeUser.save();
-
-        res.json({ status: 'success', data: user });
-    } catch (error) {
-        console.error('Erro ao convidar usuário:', error);
-        res.status(500).json({ status: 'error', message: 'Erro ao convidar usuário.' });
-    }
-});
 
 // Remover usuário de loja
 app.delete('/api/stores/:storeId/users/:userId', async (req, res) => {
@@ -797,176 +856,9 @@ app.get('/api/stores/:id', async (req, res) => {
     }
 });
 
-// --- ENDPOINTS ABACATE PAY ---
-
-/**
- * Cria uma sessão de checkout (Cobrança)
- */
-app.post('/api/checkout', async (req, res) => {
-    const { user } = req.body;
-    console.log(`[AbacatePay] Iniciando checkout para: ${user.email}`);
-
-    try {
-        // 1. Criar Cliente
-        const customerPayload = {
-            name: user.name,
-            email: user.email,
-            cellphone: user.phone || "(11) 99999-9999",
-            taxId: user.taxId || "000.000.000-00" // CPF Obrigatório
-        };
-
-        // Tenta criar o cliente
-        let customerId;
-        console.log("[AbacatePay] Criando cliente...");
-
-        const createCustomerResponse = await fetch(`${ABACATE_BASE_URL}/customer/create`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${ABACATE_API_TOKEN}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify(customerPayload)
-        });
-
-        const createCustomerData = await createCustomerResponse.json();
-
-        if (createCustomerResponse.ok && createCustomerData.data) {
-            customerId = createCustomerData.data.id;
-            console.log(`[AbacatePay] Cliente criado: ${customerId}`);
-        } else {
-            // Se falhar, tentamos listar para encontrar pelo email
-            console.log("[AbacatePay] Cliente não criado (verificando existência)...", JSON.stringify(createCustomerData));
-            const listResponse = await fetch(`${ABACATE_BASE_URL}/customer/list`, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${ABACATE_API_TOKEN}`,
-                    'Accept': 'application/json'
-                }
-            });
-            const listData = await listResponse.json();
-            const found = listData.data?.find(c => c.metadata.email === user.email);
-
-            if (found) {
-                customerId = found.id;
-                console.log(`[AbacatePay] Cliente existente encontrado: ${customerId}`);
-            } else {
-                console.error("[AbacatePay] Erro crítico: Cliente não pôde ser criado nem encontrado.");
-                return res.status(400).json({ status: 'error', message: 'Erro ao cadastrar cliente na AbacatePay. Verifique se o CPF é válido.' });
-            }
-        }
-
-        // 2. Criar Cobrança
-        const billingPayload = {
-            frequency: "ONE_TIME",
-            methods: ["PIX"], // REMOVIDO "CARD" PARA EVITAR ERRO DE PERMISSÃO
-            products: [
-                {
-                    externalId: "capi-pro-monthly",
-                    name: "Assinatura CAPI Pro (Mensal)",
-                    description: "Acesso ilimitado ao sistema de gestão CAPI.",
-                    quantity: 1,
-                    price: 4990 // R$ 49,90 em centavos
-                }
-            ],
-            returnUrl: "http://localhost:5173",
-            completionUrl: "http://localhost:5173",
-            customerId: customerId
-        };
-
-        console.log("[AbacatePay] Gerando cobrança...");
-        const billingResponse = await fetch(`${ABACATE_BASE_URL}/billing/create`, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${ABACATE_API_TOKEN}`,
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            },
-            body: JSON.stringify(billingPayload)
-        });
-
-        const billingData = await billingResponse.json();
-
-        if (billingResponse.ok && billingData.data) {
-            console.log(`[AbacatePay] Cobrança criada com sucesso: ${billingData.data.url}`);
-            return res.json({
-                status: 'success',
-                checkoutUrl: billingData.data.url,
-                billId: billingData.data.id
-            });
-        } else {
-            console.error("[AbacatePay] Erro ao criar cobrança:", JSON.stringify(billingData));
-            return res.status(500).json({ status: 'error', message: 'Erro ao gerar link de pagamento na AbacatePay.' });
-        }
-
-    } catch (error) {
-        console.error('[AbacatePay] Erro interno do servidor:', error);
-        res.status(500).json({ status: 'error', message: 'Erro interno de conexão no servidor.' });
-    }
-});
-
-/**
- * Consulta status de pagamento do usuário
- */
-app.get('/api/status', async (req, res) => {
-    const userEmail = req.query.email;
-    console.log(`[AbacatePay] Verificando status para: ${userEmail}`);
-
-    try {
-        const listResponse = await fetch(`${ABACATE_BASE_URL}/billing/list`, {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${ABACATE_API_TOKEN}`,
-                'Accept': 'application/json'
-            },
-        });
-
-        if (listResponse.ok) {
-            const data = await listResponse.json();
-
-            if (data.data && Array.isArray(data.data)) {
-                // Filtrar cobranças deste usuário
-                const userBills = data.data.filter(bill =>
-                    bill.customer?.metadata?.email === userEmail
-                );
-
-                // Ordenar por data (mais recente primeiro)
-                userBills.sort((a, b) => {
-                    const dateA = new Date(a.updatedAt || a.createdAt);
-                    const dateB = new Date(b.updatedAt || b.createdAt);
-                    return dateB - dateA;
-                });
-
-                const latestBill = userBills[0];
-
-                if (latestBill) {
-                    if (latestBill.status === 'PAID' || latestBill.status === 'COMPLETED') {
-                        return res.json({
-                            status: 'paid',
-                            message: 'Pagamento confirmado.',
-                            lastPaymentDate: latestBill.updatedAt
-                        });
-                    } else {
-                        return res.json({
-                            status: 'pending',
-                            message: 'Última cobrança ainda pendente.',
-                            billUrl: latestBill.url
-                        });
-                    }
-                }
-            }
-
-            return res.json({ status: 'pending', message: 'Nenhuma cobrança encontrada.' });
-
-        } else {
-            return res.status(listResponse.status).json({ status: 'error', message: 'Erro ao consultar API da AbacatePay' });
-        }
-
-    } catch (error) {
-        console.error('[AbacatePay] Erro de conexão:', error);
-        res.status(500).json({ status: 'error', warning: 'Erro interno ao validar pagamento.' });
-    }
-});
+// --- ENDPOINTS ABACATE PAY (REMOVED) ---
+// User migrated to CAKTO
+// Old endpoints /api/checkout and /api/status removed for security.
 
 // --- INTEGRAÇÃO GOOGLE GEMINI (AI) ---
 
@@ -1149,7 +1041,7 @@ app.post('/api/ai/command', async (req, res) => {
 // --- INICIALIZAÇÃO ---
 app.listen(port, '0.0.0.0', () => {
     console.log(`\n🚀 Backend CAPI rodando em: http://127.0.0.1:${port}`);
-    console.log(`🥑 Integrado com AbacatePay (Chave: ...${ABACATE_API_TOKEN.slice(-4)})`);
+    console.log(`🥑 Integrado com Cakto Pay`);
     console.log(`✨ Gemini AI Ativo`);
     console.log(`🍃 MongoDB Status: ${MONGODB_URI ? 'Tentando conectar...' : 'Desativado (sem URI)'}`);
 });

@@ -11,6 +11,12 @@ const storeSchema = new mongoose.Schema({
         theme: String,
         notifications: Boolean
     },
+    // Store Status Tracking
+    isOpen: { type: Boolean, default: false },
+    lastOpenedAt: { type: Date },
+    lastClosedAt: { type: Date },
+    openedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    closedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date, default: Date.now }
 });
 
