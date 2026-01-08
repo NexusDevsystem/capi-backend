@@ -997,41 +997,38 @@ app.post('/api/ai/predict-transaction', async (req, res) => {
 
         OBJETIVO: Retornar um JSON Array de objetos de transação.
 
-        REGRAS CRÍTICAS DE PAGAMENTO PARCIAL (CREDIÁRIO/FIADO):
-        1. Se o usuário mencionar um valor total e um valor pago (ex: "Total 230, pagou 130", "Deu 130 de entrada"):
-           - 'amount': Deve ser APENAS o valor que entrou no caixa (130).
-           - 'debtAmount': Deve ser a diferença restante (100).
-           - 'customerName': OBRIGATÓRIO identificar o nome do cliente. Se não tiver, use "Cliente Anônimo".
+        REGRAS CRÍTICAS DE EXTRAÇÃO DE ITENS (MÚLTIPLOS PRODUTOS):
+        1. Se o usuário disser "Vendi 1 Caneta por 5, 2 Cadernos por 20 e 1 Capa por 30":
+           - 'items': [
+               { "name": "Caneta", "quantity": 1, "unitPrice": 5, "total": 5 },
+               { "name": "Caderno", "quantity": 2, "unitPrice": 10, "total": 20 },
+               { "name": "Capa", "quantity": 1, "unitPrice": 30, "total": 30 }
+             ]
+           - 'amount': A SOMA dos totais dos itens (5 + 20 + 30 = 55), a menos que especificado venda fiado/parcial.
         
-        2. Se o usuário disser "Vendi fiado para Maria valor 500":
-           - 'amount': 0 (nada entrou no caixa agora).
-           - 'debtAmount': 500.
-           - 'customerName': "Maria".
+        2. NÃO ignore itens. Se houver 3 produtos diferentes na frase, o array 'items' DEVE ter 3 objetos.
 
-        REGRAS DE EXTRAÇÃO DE ITENS:
-        - Se disser "Vendi 2 bolsas por 230", items: [{name: "Bolsa", quantity: 2, total: 230}]. O unitPrice é calculado (115).
-        - O 'amount' final da transação segue a regra do pagamento parcial acima.
+        REGRAS DE PAGAMENTO PARCIAL (CREDIÁRIO/FIADO):
+        - Se "Total foi 100, mas pagou só 40":
+           - 'amount': 40 (O que entrou no caixa)
+           - 'debtAmount': 60 (Dívida restante)
+           - 'customerName': "Nome do Cliente" (Obrigatório se tiver dívida)
 
-        REGRAS DE PAGAMENTO DE DÍVIDA (RECEBIMENTO DE FIADO):
-        - Se o usuário disser "Recebi 50 do João da dívida" ou "João pagou 50":
-           - 'action': 'TRANSACTION'
-           - 'type': 'INCOME'
-           - 'amount': 50
-           - 'customerName': "João"
-           - 'isDebtPayment': true (Flag IMPORTANTE para abater da conta do cliente)
+        REGRAS DE METODO DE PAGAMENTO:
+        - Use APENAS: "Pix", "Dinheiro", "Crédito", "Débito", "Boleto", "Outro".
 
-        EXEMPLO DE RESPOSTA (JSON):
+        EXEMPLO DE RESPOSTA (MÚLTIPLOS ITENS):
         [
           {
             "action": "TRANSACTION",
-            "description": "Venda 2 Bolsas (Parcial)",
-            "amount": 130, 
-            "debtAmount": 100,
-            "customerName": "Camila",
+            "description": "Venda Diversos",
+            "amount": 55, 
             "type": "INCOME",
-            "paymentMethod": "Dinheiro",
-            "isDebtPayment": false,
-            "items": [{ "name": "Bolsa", "quantity": 2, "unitPrice": 115, "total": 230 }]
+            "paymentMethod": "Pix",
+            "items": [
+               { "name": "Caneta", "quantity": 1, "unitPrice": 5, "total": 5 },
+               { "name": "Caderno", "quantity": 2, "unitPrice": 10, "total": 20 }
+            ]
           }
         ]
         `;
@@ -1041,8 +1038,24 @@ app.post('/api/ai/predict-transaction', async (req, res) => {
             generationConfig: { responseMimeType: 'application/json' }
         });
 
-        const responseText = result.response.text();
-        res.json(JSON.parse(responseText));
+
+        const cleanJson = (text) => {
+            if (!text) return null;
+            return text.replace(/```json/g, '').replace(/```/g, '').trim();
+        };
+
+        const responseText = cleanJson(result.response.text());
+        console.log('[AI] Raw Response:', result.response.text()); // Debug log
+
+        let parsedData;
+        try {
+            parsedData = JSON.parse(responseText);
+        } catch (e) {
+            console.error('[AI] JSON Parse Error. Cleaned text:', responseText);
+            throw new Error('Falha ao processar resposta da IA (JSON inválido).');
+        }
+
+        res.json(parsedData);
 
     } catch (error) {
         console.error("Erro na AI Predict Transaction:", error);
@@ -1079,7 +1092,8 @@ app.post('/api/ai/extract-doc', async (req, res) => {
             generationConfig: { responseMimeType: 'application/json' }
         });
 
-        res.json(JSON.parse(result.response.text()));
+        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        res.json(JSON.parse(responseText));
     } catch (error) {
         console.error("Erro na AI Extract Doc:", error);
         res.status(500).json({ status: 'error', message: 'Erro ao processar documento.' });
@@ -1112,7 +1126,8 @@ app.post('/api/ai/extract-product', async (req, res) => {
             generationConfig: { responseMimeType: 'application/json' }
         });
 
-        res.json(JSON.parse(result.response.text()));
+        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        res.json(JSON.parse(responseText));
     } catch (error) {
         console.error("Erro na AI Extract Product:", error);
         res.status(500).json({ status: 'error', message: 'Erro ao processar produto.' });
@@ -1134,7 +1149,8 @@ app.post('/api/ai/insight', async (req, res) => {
             generationConfig: { responseMimeType: 'application/json' }
         });
 
-        res.json(JSON.parse(result.response.text()));
+        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        res.json(JSON.parse(responseText));
     } catch (error) {
         console.error("Erro na AI Insight:", error);
         res.status(500).json({ status: 'error', message: 'Erro ao gerar insights.' });
@@ -1149,7 +1165,8 @@ app.post('/api/ai/command', async (req, res) => {
             contents: [{ role: 'user', parts: [{ text: `Process this ERP command: "${text}". Return JSON with 'action' (NAVIGATE, TRANSACTION, etc) and 'targetPage' or 'data'.` }] }],
             generationConfig: { responseMimeType: 'application/json' }
         });
-        res.json(JSON.parse(result.response.text()));
+        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        res.json(JSON.parse(responseText));
     } catch (error) {
         res.status(500).json({ status: 'error', message: 'Erro no comando.' });
     }
