@@ -8,7 +8,7 @@ const userSchema = new mongoose.Schema({
     taxId: String,
     role: {
         type: String,
-        enum: ['Administrador', 'Gerente', 'Vendedor', 'Técnico', 'Aguardando', 'admin', 'user'],
+        enum: ['Proprietário', 'Administrador', 'Gerente', 'Vendedor', 'Técnico', 'Aguardando', 'admin', 'user'],
         default: 'Aguardando'
     },
     // Multi-store support
@@ -18,7 +18,7 @@ const userSchema = new mongoose.Schema({
         storeLogo: String,
         role: {
             type: String,
-            enum: ['owner', 'admin', 'manager', 'seller', 'technician'],
+            enum: ['Proprietário', 'owner', 'admin', 'manager', 'seller', 'technician'],
             required: true
         },
         joinedAt: { type: Date, default: Date.now },

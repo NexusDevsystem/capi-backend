@@ -5,7 +5,7 @@ const storeUserSchema = new mongoose.Schema({
     storeId: { type: String, required: true },
     role: {
         type: String,
-        enum: ['owner', 'admin', 'manager', 'seller', 'technician'],
+        enum: ['Proprietário', 'owner', 'admin', 'manager', 'seller', 'technician'],
         required: true
     },
     permissions: [String],

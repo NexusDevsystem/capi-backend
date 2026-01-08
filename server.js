@@ -91,10 +91,68 @@ app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
 // --- ENDPOINTS USUÁRIOS & LOJAS (MONGODB) ---
 
+// --- VALIDATORS ---
+const isValidCNPJ = (cnpj) => {
+    if (!cnpj) return false;
+    cnpj = cnpj.replace(/[^\d]+/g, '');
+    if (cnpj === '') return false;
+    if (cnpj.length !== 14) return false;
+    if (/^(\d)\1+$/.test(cnpj)) return false;
+
+    let tamanho = cnpj.length - 2
+    let numeros = cnpj.substring(0, tamanho);
+    let digitos = cnpj.substring(tamanho);
+    let soma = 0;
+    let pos = tamanho - 7;
+    for (let i = tamanho; i >= 1; i--) {
+        soma += parseInt(numeros.charAt(tamanho - i)) * pos--;
+        if (pos < 2) pos = 9;
+    }
+    let resultado = soma % 11 < 2 ? 0 : 11 - soma % 11;
+    if (resultado !== parseInt(digitos.charAt(0))) return false;
+
+    tamanho = tamanho + 1;
+    numeros = cnpj.substring(0, tamanho);
+    soma = 0;
+    pos = tamanho - 7;
+    for (let i = tamanho; i >= 1; i--) {
+        soma += parseInt(numeros.charAt(tamanho - i)) * pos--;
+        if (pos < 2) pos = 9;
+    }
+    resultado = soma % 11 < 2 ? 0 : 11 - soma % 11;
+    if (resultado !== parseInt(digitos.charAt(1))) return false;
+    return true;
+};
+
+const isStrongPassword = (pass) => {
+    return pass && pass.length >= 8 && /\d/.test(pass) && /[a-zA-Z]/.test(pass);
+};
+
+const isValidPhone = (phone) => {
+    if (!phone) return false;
+    const p = phone.replace(/\D/g, '');
+    return p.length >= 10 && p.length <= 11;
+};
+
 // Criar Usuário
 app.post('/api/users', async (req, res) => {
     try {
         const { name, email, password, phone, taxId, role, storeId, avatarUrl, status } = req.body;
+
+        // --- SECURITY VALIDATION ---
+        if (!isStrongPassword(password)) {
+            return res.status(400).json({ status: 'error', message: 'Senha fraca. Mínimo 8 caracteres, letras e números.' });
+        }
+
+        const isOwner = role === 'Proprietário' || role === 'owner';
+        if (isOwner) {
+            if (!isValidCNPJ(taxId)) {
+                return res.status(400).json({ status: 'error', message: 'CNPJ inválido ou ausente.' });
+            }
+            if (!isValidPhone(phone)) {
+                return res.status(400).json({ status: 'error', message: 'Telefone inválido.' });
+            }
+        }
 
         // Verificar se usuário já existe
         const existingUser = await User.findOne({ email });
@@ -123,10 +181,13 @@ app.post('/api/users', async (req, res) => {
         });
         await newUser.save();
 
-        const userResponse = newUser.toObject();
+        const userResponse = newUser.toJSON();
         delete userResponse.password;
 
-        res.status(201).json({ status: 'success', data: userResponse });
+        // Generate token for auto-login
+        const token = generateToken(newUser);
+
+        res.status(201).json({ status: 'success', data: { ...userResponse, token } });
     } catch (error) {
         console.error('Erro ao criar usuário:', error);
         res.status(500).json({ status: 'error', message: 'Erro ao criar usuário.' });
@@ -152,7 +213,7 @@ app.post('/api/login', async (req, res) => {
             }
         }
 
-        const userResponse = user.toObject();
+        const userResponse = user.toJSON();
         delete userResponse.password;
 
         const token = generateToken(user);
@@ -553,6 +614,55 @@ app.post('/api/users/:id/activate-subscription', async (req, res) => {
     }
 });
 
+// --- MANUAL ACTIVATION ENDPOINT (DEV/ADMIN) ---
+app.post('/api/activate-by-email', async (req, res) => {
+    try {
+        const { email } = req.body;
+        console.log(`[API] Manual activation request for: ${email}`);
+
+        const user = await User.findOne({ email });
+
+        if (!user) {
+            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
+        }
+
+        const nextBilling = new Date();
+        nextBilling.setDate(nextBilling.getDate() + 30);
+
+        user.subscriptionStatus = 'ACTIVE';
+        user.trialEndsAt = null;
+        user.nextBillingAt = nextBilling;
+
+        // Add manual invoice record
+        user.invoices = user.invoices || [];
+        user.invoices.unshift({
+            id: `MANUAL-${Date.now()}`,
+            date: new Date(),
+            amount: 0,
+            status: 'PAID',
+            method: 'MANUAL',
+            url: '#'
+        });
+
+        await user.save();
+        console.log(`[API] Manually activated subscription for ${user.email}`);
+
+        // Return user data (using toJSON to ensure id is present)
+        const userData = user.toJSON();
+        delete userData.password;
+
+        res.json({
+            status: 'success',
+            message: 'Assinatura ativada manualmente com sucesso!',
+            user: userData
+        });
+
+    } catch (error) {
+        console.error('Error in manual activation:', error);
+        res.status(500).json({ status: 'error', message: 'Erro interno ao ativar assinatura.' });
+    }
+});
+
 // --- CAKTO WEBHOOK ENDPOINT ---
 app.post('/api/webhooks/cakto', async (req, res) => {
     try {
@@ -794,10 +904,17 @@ app.delete('/api/bank-accounts/:id', deleteHandler(BankAccount));
 // Criar Loja
 app.post('/api/stores', async (req, res) => {
     try {
+        console.log('[API] Creating store with body:', req.body);
         const { name, ownerId, address, phone, logoUrl } = req.body;
+
+        if (!ownerId) {
+            console.error('[API] Error: ownerId is missing');
+            return res.status(400).json({ status: 'error', message: 'Owner ID is required' });
+        }
 
         const newStore = new Store({ name, owner: ownerId, address, phone, logoUrl });
         await newStore.save();
+        console.log('[API] Store saved successfully:', newStore._id);
 
         // Add store to owner's stores array (multi-store support)
         if (ownerId) {
