@@ -1,11 +1,20 @@
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
+import { encrypt, decrypt, hashField } from '../utils/encryption.js';
 
 const userSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
+
+    // Encrypted Fields (stored as IV:Cipher)
     phone: String,
     taxId: String,
+
+    // Blind Indexes for Searching (Deterministic Hash)
+    phoneHash: { type: String, index: true },
+    taxIdHash: { type: String, index: true },
+
     role: {
         type: String,
         enum: ['Proprietário', 'Administrador', 'Gerente', 'Vendedor', 'Técnico', 'Aguardando', 'admin', 'user'],
@@ -53,13 +62,56 @@ const userSchema = new mongoose.Schema({
     }]
 });
 
-// Transform _id to id when converting to JSON
+// --- ENCRYPTION & HASHING MIDDLEWARE ---
+
+userSchema.pre('save', async function (next) {
+    // 1. Hash Password
+    if (this.isModified('password')) {
+        // Only hash if not already hashed (bcrypt hashes start with $2a$ or $2b$)
+        if (!this.password.startsWith('$2')) {
+            this.password = await bcrypt.hash(this.password, 10);
+        }
+    }
+
+    // 2. Encrypt Phone
+    if (this.isModified('phone') && this.phone) {
+        if (!this.phone.includes(':')) { // Prevent double encryption
+            this.phoneHash = hashField(this.phone); // Save searchable hash
+            this.phone = encrypt(this.phone);       // Save encrypted data
+        }
+    }
+
+    // 3. Encrypt TaxID
+    if (this.isModified('taxId') && this.taxId) {
+        if (!this.taxId.includes(':')) {
+            this.taxIdHash = hashField(this.taxId); // Save searchable hash
+            this.taxId = encrypt(this.taxId);       // Save encrypted data
+        }
+    }
+
+    next();
+});
+
+// --- HELPER METHODS ---
+
+userSchema.methods.comparePassword = async function (candidatePassword) {
+    return bcrypt.compare(candidatePassword, this.password);
+};
+
+// Transform _id to id when converting to JSON and DECRYPT fields
 userSchema.set('toJSON', {
     virtuals: true,
     versionKey: false,
     transform: function (doc, ret) {
         ret.id = ret._id;
         delete ret._id;
+        delete ret.password;
+        delete ret.phoneHash;
+        delete ret.taxIdHash;
+
+        // Auto-decrypt for API responses
+        if (ret.phone) ret.phone = decrypt(ret.phone);
+        if (ret.taxId) ret.taxId = decrypt(ret.taxId);
     }
 });
 

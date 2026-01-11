@@ -134,30 +134,60 @@ const isValidPhone = (phone) => {
     return p.length >= 10 && p.length <= 11;
 };
 
-// Criar Usuário
+const isValidCPF = (cpf) => {
+    if (!cpf) return false;
+    cpf = cpf.replace(/[^\d]+/g, '');
+    if (cpf.length !== 11 || /^(\d)\1+$/.test(cpf)) return false;
+    let soma = 0, resto;
+    for (let i = 1; i <= 9; i++) soma = soma + parseInt(cpf.substring(i - 1, i)) * (11 - i);
+    resto = (soma * 10) % 11;
+    if ((resto === 10) || (resto === 11)) resto = 0;
+    if (resto !== parseInt(cpf.substring(9, 10))) return false;
+    soma = 0;
+    for (let i = 1; i <= 10; i++) soma = soma + parseInt(cpf.substring(i - 1, i)) * (12 - i);
+    resto = (soma * 10) % 11;
+    if ((resto === 10) || (resto === 11)) resto = 0;
+    if (resto !== parseInt(cpf.substring(10, 11))) return false;
+    return true;
+};
+
+import { hashField } from './utils/encryption.js';
+
+// Registrar Usuário (Público)
 app.post('/api/users', async (req, res) => {
     try {
         const { name, email, password, phone, taxId, role, storeId, avatarUrl, status } = req.body;
 
-        // --- SECURITY VALIDATION ---
-        if (!isStrongPassword(password)) {
-            return res.status(400).json({ status: 'error', message: 'Senha fraca. Mínimo 8 caracteres, letras e números.' });
+        // Validação básica
+        if (!name || !email || !password) {
+            return res.status(400).json({ status: 'error', message: 'Dados obrigatórios faltando.' });
         }
 
-        const isOwner = role === 'Proprietário' || role === 'owner';
-        if (isOwner) {
-            if (!isValidCNPJ(taxId)) {
-                return res.status(400).json({ status: 'error', message: 'CNPJ inválido ou ausente.' });
+        // Validação extra se for Dono
+        if (role === 'Proprietário') {
+            if (!isValidCNPJ(taxId) && !isValidCPF(taxId)) {
+                return res.status(400).json({ status: 'error', message: 'CPF ou CNPJ inválido ou ausente.' });
             }
             if (!isValidPhone(phone)) {
                 return res.status(400).json({ status: 'error', message: 'Telefone inválido.' });
             }
         }
 
-        // Verificar se usuário já existe
-        const existingUser = await User.findOne({ email });
+        // Verificar se usuário já existe (Email, CNPJ ou Telefone)
+        // Usamos hashField para buscar nos índices cegos
+        const duplicateQuery = [{ email }];
+        if (phone) duplicateQuery.push({ phoneHash: hashField(phone) });
+        if (taxId) duplicateQuery.push({ taxIdHash: hashField(taxId) });
+
+        const existingUser = await User.findOne({ $or: duplicateQuery });
+
         if (existingUser) {
-            return res.status(400).json({ status: 'error', message: 'Usuário já cadastrado.' });
+            let msg = 'Usuário já cadastrado.';
+            if (existingUser.email === email) msg = 'Email já cadastrado.';
+            else if (existingUser.phoneHash === hashField(phone)) msg = 'Telefone já cadastrado.';
+            else if (existingUser.taxIdHash === hashField(taxId)) msg = 'CNPJ/CPF já cadastrado.';
+
+            return res.status(400).json({ status: 'error', message: msg });
         }
 
         // --- LÓGICA DE TRIAL DE 7 DIAS ---
@@ -165,6 +195,7 @@ app.post('/api/users', async (req, res) => {
         const trialEnd = new Date();
         trialEnd.setDate(now.getDate() + 7); // +7 dias
 
+        // Nota: O hook pre-save do User vai criptografar phone/taxId e hashear a senha automaticamente.
         const newUser = new User({
             name,
             email,
@@ -182,7 +213,7 @@ app.post('/api/users', async (req, res) => {
         await newUser.save();
 
         const userResponse = newUser.toJSON();
-        delete userResponse.password;
+        // Password/Hashes already removed by toJSON transform
 
         // Generate token for auto-login
         const token = generateToken(newUser);
@@ -198,9 +229,33 @@ app.post('/api/users', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        const user = await User.findOne({ email, password }); // In production, use bcrypt.compare
+
+        // 1. Find user by email
+        const user = await User.findOne({ email });
 
         if (!user) {
+            return res.status(401).json({ status: 'error', message: 'Email ou senha incorretos.' });
+        }
+
+        // 2. Password Check (Secure + Legacy Migration)
+        let isMatch = false;
+
+        // A. Check Hash (Standard Secure Login)
+        if (user.password.startsWith('$2')) {
+            isMatch = await user.comparePassword(password);
+        }
+        // B. Check Clear Text (Legacy Migration)
+        else {
+            if (user.password === password) {
+                isMatch = true;
+                // AUTO-MIGRATE: Hash it now!
+                user.password = password; // Setting it triggers Pre-Save hook which hashes it
+                await user.save();
+                console.log(`[Security] Migrated legacy password for user ${user.email}`);
+            }
+        }
+
+        if (!isMatch) {
             return res.status(401).json({ status: 'error', message: 'Email ou senha incorretos.' });
         }
 
@@ -214,8 +269,6 @@ app.post('/api/login', async (req, res) => {
         }
 
         const userResponse = user.toJSON();
-        delete userResponse.password;
-
         const token = generateToken(user);
 
         res.json({ status: 'success', data: { ...userResponse, token } });
