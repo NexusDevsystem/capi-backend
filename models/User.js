@@ -64,7 +64,7 @@ const userSchema = new mongoose.Schema({
 
 // --- ENCRYPTION & HASHING MIDDLEWARE ---
 
-userSchema.pre('save', async function (next) {
+userSchema.pre('save', async function () {
     // 1. Hash Password
     if (this.isModified('password')) {
         // Only hash if not already hashed (bcrypt hashes start with $2a$ or $2b$)
@@ -88,8 +88,6 @@ userSchema.pre('save', async function (next) {
             this.taxId = encrypt(this.taxId);       // Save encrypted data
         }
     }
-
-    next();
 });
 
 // --- HELPER METHODS ---
