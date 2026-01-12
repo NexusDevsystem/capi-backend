@@ -190,10 +190,10 @@ app.post('/api/users', async (req, res) => {
             return res.status(400).json({ status: 'error', message: msg });
         }
 
-        // --- LÓGICA DE TRIAL DE 7 DIAS ---
+        // --- LÓGICA DE TRIAL DE 2 DIAS ---
         const now = new Date();
         const trialEnd = new Date();
-        trialEnd.setDate(now.getDate() + 7); // +7 dias
+        trialEnd.setDate(now.getDate() + 2); // +2 dias
 
         // Nota: O hook pre-save do User vai criptografar phone/taxId e hashear a senha automaticamente.
         const newUser = new User({
@@ -222,6 +222,66 @@ app.post('/api/users', async (req, res) => {
     } catch (error) {
         console.error('Erro ao criar usuário:', error);
         res.status(500).json({ status: 'error', message: 'Erro ao criar usuário.' });
+    }
+});
+
+// --- ADMIN: Fix Trial Periods (One-time migration) ---
+// GET /api/admin/fix-trials?secret=YOUR_SECRET
+// Sets trialEndsAt to memberSince + 2 days for all TRIAL users
+app.get('/api/admin/fix-trials', async (req, res) => {
+    try {
+        // Simple secret protection (use env var in production)
+        const { secret } = req.query;
+        if (secret !== 'capi2024fix') {
+            return res.status(403).json({ error: 'Unauthorized' });
+        }
+
+        console.log('[ADMIN] Starting trial fix migration...');
+
+        // Find all users in TRIAL status
+        const trialUsers = await User.find({ subscriptionStatus: 'TRIAL' });
+        console.log(`[ADMIN] Found ${trialUsers.length} users in TRIAL status`);
+
+        let updated = 0;
+        const results = [];
+
+        for (const user of trialUsers) {
+            const startDate = user.memberSince || user.createdAt || new Date();
+            const start = new Date(startDate);
+
+            // Calculate correct end: memberSince + 2 days
+            const correctEnd = new Date(start);
+            correctEnd.setDate(start.getDate() + 2);
+
+            // Only update if different (more than 1 hour difference)
+            const currentEnd = user.trialEndsAt ? new Date(user.trialEndsAt) : null;
+            const needsUpdate = !currentEnd || Math.abs(currentEnd.getTime() - correctEnd.getTime()) > 3600000;
+
+            if (needsUpdate) {
+                user.trialEndsAt = correctEnd;
+                user.nextBillingAt = correctEnd; // Also sync nextBillingAt
+                await user.save();
+                updated++;
+                results.push({
+                    email: user.email,
+                    memberSince: start.toISOString(),
+                    oldTrialEnd: currentEnd ? currentEnd.toISOString() : 'N/A',
+                    newTrialEnd: correctEnd.toISOString()
+                });
+            }
+        }
+
+        console.log(`[ADMIN] Updated ${updated} users`);
+        res.json({
+            success: true,
+            message: `Fixed ${updated} user(s) trial periods to 2 days`,
+            totalTrialUsers: trialUsers.length,
+            updated,
+            results
+        });
+    } catch (error) {
+        console.error('[ADMIN] Fix trials error:', error);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -1224,6 +1284,15 @@ app.post('/api/ai/command', async (req, res) => {
         res.status(500).json({ status: 'error', message: 'Erro no comando.' });
     }
 });
+
+// --- DATABASE CONNECTION ---
+if (process.env.MONGODB_URI) {
+    mongoose.connect(process.env.MONGODB_URI)
+        .then(() => console.log('🍃 MongoDB Conectado com sucesso!'))
+        .catch(err => console.error('❌ Erro ao conectar no MongoDB:', err));
+} else {
+    console.warn('⚠️  MONGODB_URI não definida no .env. O banco de dados não será conectado.');
+}
 
 // --- INICIALIZAÇÃO ---
 app.listen(port, '0.0.0.0', () => {
