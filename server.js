@@ -285,6 +285,68 @@ app.get('/api/admin/fix-trials', async (req, res) => {
     }
 });
 
+// --- Google Authentication ---
+app.post('/api/auth/google', async (req, res) => {
+    try {
+        const { email, name, photoUrl, googleId } = req.body;
+        console.log(`[AUTH] Google Login attempt: ${email}`);
+
+        if (!email) {
+            return res.status(400).json({ status: 'error', message: 'Email é obrigatório.' });
+        }
+
+        let user = await User.findOne({ email });
+
+        if (user) {
+            // Login existing user
+            console.log(`[AUTH] Google User found: ${user.email}`);
+            const token = generateToken(user);
+
+            // Update avatar if provided and not set
+            if (photoUrl && !user.avatarUrl) {
+                user.avatarUrl = photoUrl;
+                await user.save();
+            }
+
+            return res.json({ status: 'success', data: { ...user.toJSON(), token } });
+        } else {
+            // Register new user
+            console.log(`[AUTH] Creating new Google User: ${email}`);
+
+            const now = new Date();
+            const trialEnd = new Date();
+            trialEnd.setDate(now.getDate() + 2); // 2 Day Trial logic
+
+            // Generate random secure password (user won't use it, but needed for schema)
+            const randomPassword = Math.random().toString(36).slice(-8) + Math.random().toString(36).slice(-8) + "!1Aa";
+
+            user = new User({
+                name: name || 'Usuário Google',
+                email,
+                password: randomPassword, // Will be hashed by pre-save
+                avatarUrl: photoUrl,
+                role: 'owner', // Default role
+                status: 'Ativo', // Active immediately as email is verified by Google
+                subscriptionStatus: 'TRIAL',
+                trialEndsAt: trialEnd,
+                nextBillingAt: trialEnd, // Sync billing date
+                memberSince: now,
+                stores: [],
+                activeStoreId: null
+            });
+
+            await user.save();
+            const token = generateToken(user);
+
+            // Return isNewUser flag to trigger store creation flow on frontend
+            return res.status(201).json({ status: 'success', data: { ...user.toJSON(), token, isNewUser: true } });
+        }
+    } catch (error) {
+        console.error('Google Auth Error:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao autenticar com Google.' });
+    }
+});
+
 // Login
 app.post('/api/login', async (req, res) => {
     try {
