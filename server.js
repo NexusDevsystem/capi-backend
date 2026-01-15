@@ -569,8 +569,10 @@ app.post('/api/auth/google', async (req, res) => {
             });
         }
     } catch (error) {
-        console.error('Google Auth Error:', error);
-        res.status(500).json({ status: 'error', message: 'Erro ao autenticar com Google.' });
+        console.error('❌ Google Auth Error:', error);
+        console.error('Error stack:', error.stack);
+        console.error('Error details:', JSON.stringify(error, null, 2));
+        res.status(500).json({ status: 'error', message: 'Erro ao autenticar com Google.', details: error.message });
     }
 });
 
