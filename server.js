@@ -2,16 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import dotenv from 'dotenv';
-import prismaPromise from './prismaClient.js';
+import prisma from './prismaClient.js';
 import { authMiddleware, generateToken } from './middleware/auth.js';
 import { encrypt, decrypt, hashField } from './utils/encryption.js';
 import bcrypt from 'bcryptjs';
 
 dotenv.config();
-
-// Wait for Prisma to initialize
-const prisma = await prismaPromise;
-console.log('✅ Prisma Client initialized successfully');
 
 // Check for Fetch API (Node 18+ has it built-in)
 if (!globalThis.fetch) {
