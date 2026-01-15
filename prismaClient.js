@@ -1,22 +1,9 @@
-import { Pool } from 'pg';
-import { PrismaPg } from '@prisma/adapter-pg';
-import pkg from '@prisma/client';
+/**
+ * Database Client
+ * Now using Supabase REST API instead of direct PostgreSQL connection
+ * This avoids IPv6 connectivity issues on Render
+ */
+import db from './supabaseDb.js';
 
-const { PrismaClient } = pkg;
-import dotenv from 'dotenv';
-
-dotenv.config();
-
-const connectionString = process.env.DATABASE_URL;
-
-const pool = new Pool({
-    connectionString,
-    ssl: {
-        rejectUnauthorized: false
-    }
-});
-
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
-export default prisma;
+// Re-export the Supabase database wrapper as 'prisma' for compatibility
+export default db;
