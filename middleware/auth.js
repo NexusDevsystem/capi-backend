@@ -30,7 +30,7 @@ export const authMiddleware = (req, res, next) => {
 export const generateToken = (user) => {
     return jwt.sign(
         {
-            id: user._id,
+            id: user.id || user._id,
             email: user.email,
             role: user.role,
             storeId: user.storeId
