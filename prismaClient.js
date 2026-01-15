@@ -9,13 +9,17 @@ dotenv.config();
 
 const connectionString = process.env.DATABASE_URL;
 
-// Force IPv4 by parsing the connection string and setting host explicitly
+// Force IPv4 connection
 const pool = new Pool({
     connectionString,
-    // Force IPv4 resolution
-    host: 'db.dkkecqqmvycpyicxgzqk.supabase.co',
-    connectionTimeoutMillis: 10000,
+    ssl: {
+        rejectUnauthorized: false
+    }
 });
+
+// Override DNS resolution to use IPv4 only
+pool.options.host = 'db.dkkecqqmvycpyicxgzqk.supabase.co';
+pool.options.family = 4; // Force IPv4
 
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
