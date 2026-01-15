@@ -84,6 +84,25 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
+// Health Check Endpoint
+app.get('/api/health', async (req, res) => {
+    try {
+        // Test database connection
+        await prisma.$queryRaw`SELECT 1`;
+        res.json({
+            status: 'ok',
+            database: 'connected',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message
+        });
+    }
+});
+
 // --- ENDPOINTS USUÁRIOS & LOJAS (MONGODB) ---
 
 // --- VALIDATORS ---
