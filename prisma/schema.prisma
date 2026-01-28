@@ -7,9 +7,12 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
-// --- USERS & AUTH ---
+// ============================================
+// USER & AUTHENTICATION
+// ============================================
 
 model User {
   id        String   @id @default(uuid())
@@ -17,234 +20,324 @@ model User {
   email     String   @unique
   password  String
   
-  // Encrypted Fields
-  phone     String?
-  taxId     String?
+  // Encrypted sensitive data
+  phone         String?
+  taxId         String?
+  phoneHash     String?  @unique
+  taxIdHash     String?  @unique
   
-  // Blind Indexes (for searching)
-  phoneHash String?
-  taxIdHash String?
-  
-  role      String   @default("Aguardando")
-  status    String   @default("Pendente")
-  avatarUrl String?
-  googleId  String?  @unique
+  role          String   @default("Aguardando") // Proprietário, Administrador, Gerente, Vendedor, Técnico, Aguardando
+  status        String   @default("Pendente")   // Ativo, Ausente, Pendente
+  avatarUrl     String?
+  googleId      String?  @unique
   
   // Subscription
-  subscriptionStatus String    @default("FREE")
+  subscriptionStatus String   @default("FREE") // FREE, TRIAL, ACTIVE, PENDING, CANCELED
   trialEndsAt        DateTime?
   nextBillingAt      DateTime?
-  memberSince        DateTime  @default(now())
-  lastAccess         DateTime  @default(now())
+  memberSince        DateTime @default(now())
+  lastAccess         DateTime @default(now())
+  
+  // Multi-store
+  activeStoreId String?
+  activeStore   Store?  @relation("ActiveStore", fields: [activeStoreId], references: [id])
   
   // Relations
-  stores         StoreUser[]
-  ownedStores    Store[]       @relation("Owner")
-  invoices       Invoice[]
+  ownedStores   Store[]     @relation("OwnedStores")
+  storeUsers    StoreUser[]
+  invoices      Invoice[]
   
-  // Tracking
-  activeStoreId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
   
-  @@map("users")
+  @@index([email])
+  @@index([googleId])
+  @@index([phoneHash])
+  @@index([taxIdHash])
 }
 
+// ============================================
+// STORE & MULTI-TENANCY
+// ============================================
+
 model Store {
-  id           String      @id @default(uuid())
-  name         String
-  ownerId      String
-  owner        User        @relation("Owner", fields: [ownerId], references: [id])
-  address      String?
-  phone        String?
-  logoUrl      String?
+  id       String  @id @default(uuid())
+  name     String
+  ownerId  String
+  owner    User    @relation("OwnedStores", fields: [ownerId], references: [id])
   
-  // Settings (JSON)
-  settings     Json?
+  address  String?
+  phone    String?
+  logoUrl  String?
   
-  // Status
-  isOpen       Boolean     @default(false)
-  lastOpenedAt DateTime?
-  lastClosedAt DateTime?
-  openedBy     String?
-  closedBy     String?
+  // Settings stored as JSON
+  settings Json    @default("{}")
+  
+  // Store status
+  isOpen        Boolean   @default(false)
+  lastOpenedAt  DateTime?
+  lastClosedAt  DateTime?
+  openedBy      String?
+  closedBy      String?
   
   // Relations
-  team         StoreUser[]
-  products     Product[]
-  transactions Transaction[]
-  customers    Customer[]
-  suppliers    Supplier[]
-  bankAccounts BankAccount[]
-  cashClosings CashClosing[]
-  serviceOrders ServiceOrder[]
+  storeUsers     StoreUser[]
+  transactions   Transaction[]
+  customers      Customer[]
+  products       Product[]
+  serviceOrders  ServiceOrder[]
+  bankAccounts   BankAccount[]
+  cashClosings   CashClosing[]
+  suppliers      Supplier[]
+  activeUsers    User[]         @relation("ActiveStore")
   
-  createdAt    DateTime    @default(now())
-
-  @@map("stores")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([ownerId])
+  @@index([name])
 }
 
 model StoreUser {
-  id        String   @id @default(uuid())
-  userId    String
-  storeId   String
-  role      String
-  user      User     @relation(fields: [userId], references: [id])
-  store     Store    @relation(fields: [storeId], references: [id])
+  id      String @id @default(uuid())
+  userId  String
+  user    User   @relation(fields: [userId], references: [id])
+  storeId String
+  store   Store  @relation(fields: [storeId], references: [id])
   
-  permissions String[] 
-  joinedAt    DateTime @default(now())
-  status      String   @default("active")
-  invitedBy   String?
+  role        String   // owner, admin, manager, seller, technician
+  permissions String[] @default([])
+  status      String   @default("active") // active, Ativo, Pendente, inactive
   
   // Financial
-  salary      Float?
-  commission  Float?
-
+  salary     Float?
+  commission Float?
+  
+  // Metadata
+  joinedAt  DateTime @default(now())
+  invitedBy String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
   @@unique([userId, storeId])
-  @@map("store_users")
+  @@index([storeId])
+  @@index([userId])
 }
 
-// --- FINANCIAL & ERP ---
+// ============================================
+// FINANCIAL
+// ============================================
 
-model Product {
+model Transaction {
   id          String   @id @default(uuid())
   storeId     String
   store       Store    @relation(fields: [storeId], references: [id])
   
-  name        String
-  sku         String?
-  barcode     String?
-  costPrice   Decimal?  @db.Decimal(10, 2)
-  salePrice   Decimal?  @db.Decimal(10, 2)
-  stock       Int?
-  minStock    Int?
-  expiryDate  DateTime?
+  description String?
+  amount      Float
+  type        String   // INCOME, EXPENSE
+  category    String?
+  paymentMethod String? // Pix, Dinheiro, Crédito, Débito, Boleto, Outro
+  status      String   @default("COMPLETED") // PENDING, COMPLETED, PAID, OVERDUE, SCHEDULED
+  date        DateTime @default(now())
+  entity      String?  // Customer/Supplier name
   
-  // Tax Data (NCM, CEST, CFOP, Origin)
-  taxData     Json? 
-
-  @@map("products")
+  // Items sold (stored as JSON for flexibility)
+  items Json?
+  
+  bankAccountId String?
+  bankAccount   BankAccount? @relation(fields: [bankAccountId], references: [id])
+  
+  // Flags
+  isDebtPayment Boolean @default(false)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([date(sort: Desc)])
+  @@index([type])
+  @@index([status])
 }
 
-model Transaction {
+model BankAccount {
+  id       String  @id @default(uuid())
+  storeId  String
+  store    Store   @relation(fields: [storeId], references: [id])
+  
+  name     String?
+  type     String?
+  balance  Float   @default(0)
+  
+  transactions Transaction[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+}
+
+model CashClosing {
   id            String   @id @default(uuid())
   storeId       String
   store         Store    @relation(fields: [storeId], references: [id])
   
-  description   String?
-  amount        Decimal  @db.Decimal(12, 2)
-  type          String   // INCOME, EXPENSE
-  category      String?
-  paymentMethod String?
-  status        String?
   date          DateTime
+  totalRevenue  Float
+  totalExpense  Float
+  balance       Float
   
-  entity        String? // Name of person involved
-  items         Json?    // Array of objects { productName, quantity, unitPrice, total }
+  // Breakdown by payment method (stored as JSON)
+  breakdown Json @default("{\"pix\": 0, \"cash\": 0, \"card\": 0, \"other\": 0}")
   
-  bankAccountId String?
-
-  @@map("transactions")
+  notes     String?
+  closedBy  String?
+  closedAt  DateTime?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([date(sort: Desc)])
 }
 
 model Invoice {
-  id        String   @id @default(uuid()) // Can happen to be 'MANUAL-...'
-  userId    String
-  user      User     @relation(fields: [userId], references: [id])
+  id     String   @id @default(uuid())
+  userId String
+  user   User     @relation(fields: [userId], references: [id])
   
-  date      DateTime
-  amount    Decimal  @db.Decimal(10, 2)
-  status    String
-  method    String? // PIX, CARD, MANUAL
-  url       String?
+  date   DateTime
+  amount Float
+  status String   // PAID, PENDING, EXPIRED
+  method String?  // PIX, CARD, MANUAL
+  url    String?
   
-  @@map("invoices")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([userId])
+  @@index([date(sort: Desc)])
+  @@index([status])
 }
 
-model Customer {
-  id            String   @id @default(uuid())
-  storeId       String
-  store         Store    @relation(fields: [storeId], references: [id])
-  
-  name          String
-  phone         String?
-  phoneHash     String?
-  
-  balance       Decimal? @default(0) @db.Decimal(10, 2)
-  
-  // Simple purchase history log
-  items         Json? 
-  
-  lastUpdate    DateTime?
-  pipelineStage String?
+// ============================================
+// INVENTORY & PRODUCTS
+// ============================================
 
-  @@map("customers")
+model Product {
+  id       String  @id @default(uuid())
+  storeId  String
+  store    Store   @relation(fields: [storeId], references: [id])
+  
+  name     String
+  sku      String?
+  barcode  String?
+  
+  // Pricing
+  costPrice Float @default(0)
+  salePrice Float @default(0)
+  
+  // Stock
+  stock    Int @default(0)
+  minStock Int @default(0)
+  
+  expiryDate DateTime?
+  
+  // Tax data (stored as JSON)
+  taxData Json @default("{}")
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([sku])
+  @@index([barcode])
+}
+
+// ============================================
+// CRM & CUSTOMERS
+// ============================================
+
+model Customer {
+  id       String  @id @default(uuid())
+  storeId  String
+  store    Store   @relation(fields: [storeId], references: [id])
+  
+  name     String
+  
+  // Encrypted phone
+  phone     String?
+  phoneHash String?
+  
+  // Crediário (account balance)
+  balance Float @default(0)
+  
+  // Purchase/debt history (stored as JSON array)
+  items Json @default("[]")
+  
+  lastUpdate DateTime?
+  
+  // CRM Pipeline
+  pipelineStage String? // LEAD, NEGOCIACAO, FECHADO, PERDIDO
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([phoneHash])
+  @@index([pipelineStage])
 }
 
 model Supplier {
-  id          String   @id @default(uuid())
-  storeId     String
-  store       Store    @relation(fields: [storeId], references: [id])
+  id       String  @id @default(uuid())
+  storeId  String
+  store    Store   @relation(fields: [storeId], references: [id])
   
   name        String
   contactName String?
   email       String?
-  phone       String?
-  phoneHash   String?
   
-  category    String?
-  notes       String?
-
-  @@map("suppliers")
+  // Encrypted phone
+  phone     String?
+  phoneHash String?
+  
+  category String?
+  notes    String?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([phoneHash])
 }
 
-model BankAccount {
-  id      String   @id @default(uuid())
-  storeId String
-  store   Store    @relation(fields: [storeId], references: [id])
-  
-  name    String?
-  type    String?
-  balance Decimal? @db.Decimal(12, 2)
-
-  @@map("bank_accounts")
-}
-
-model CashClosing {
-  id           String   @id @default(uuid())
-  storeId      String
-  store        Store    @relation(fields: [storeId], references: [id])
-  
-  date         DateTime
-  totalRevenue Decimal  @db.Decimal(12, 2)
-  totalExpense Decimal  @db.Decimal(12, 2)
-  balance      Decimal  @db.Decimal(12, 2)
-  
-  // Breakdown { pix: 10, cash: 20 }
-  breakdown    Json?
-  
-  notes        String?
-  closedBy     String?
-  closedAt     DateTime?
-
-  @@map("cash_closings")
-}
+// ============================================
+// SERVICE ORDERS
+// ============================================
 
 model ServiceOrder {
-  id           String   @id @default(uuid())
+  id           String  @id @default(uuid())
   storeId      String
-  store        Store    @relation(fields: [storeId], references: [id])
+  store        Store   @relation(fields: [storeId], references: [id])
   
   customerId   String?
   customerName String?
   device       String?
   description  String?
-  status       String?
+  status       String  @default("ABERTO") // ABERTO, EM_ANALISE, AGUARDANDO_PECA, CONCLUIDO, ENTREGUE
   
-  partsTotal   Decimal? @db.Decimal(10, 2)
-  laborTotal   Decimal? @db.Decimal(10, 2)
-  total        Decimal? @db.Decimal(10, 2)
+  // Pricing
+  partsTotal Float @default(0)
+  laborTotal Float @default(0)
+  total      Float @default(0)
   
-  openDate     DateTime?
-
-  @@map("service_orders")
+  openDate DateTime @default(now())
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([storeId])
+  @@index([status])
+  @@index([openDate(sort: Desc)])
 }

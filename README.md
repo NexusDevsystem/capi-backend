@@ -1,115 +1,176 @@
-# CAPI Backend
+# CAPI ERP - Backend
 
-Backend API para o sistema CAPI - Gestão Inteligente de Vendas com IA.
+Sistema ERP completo para pequenos e médios negócios.
 
-## 🚀 Tecnologias
+## 🚀 Stack Tecnológico
 
-- **Node.js** - Runtime JavaScript
-- **Express** - Framework web
-- **MongoDB** - Banco de dados
-- **Mongoose** - ODM para MongoDB
-- **Google Gemini AI** - Inteligência Artificial
-- **CAKTO** - Gateway de pagamento
+- **Runtime**: Node.js 18+
+- **Framework**: Express.js 5.2.1
+- **Banco de Dados**: MongoDB (via Mongoose 9.1.2)
+- **Autenticação**: JWT + bcryptjs
+- **Criptografia**: AES-256 para dados sensíveis
+- **Pagamentos**: Cakto (gateway brasileiro)
+- **IA**: Google Gemini API
 
-## 📋 Pré-requisitos
+## 📦 Instalação
 
-- Node.js 18+ 
-- MongoDB Atlas (ou local)
-- Conta CAKTO
-- API Key do Google Gemini
-
-## 🔧 Instalação
-
-1. Clone o repositório:
 ```bash
-git clone https://github.com/NexusDevsystem/capi-backend.git
-cd capi-backend
-```
-
-2. Instale as dependências:
-```bash
+# Instalar dependências
 npm install
-```
 
-3. Configure as variáveis de ambiente:
-```bash
+# Configurar variáveis de ambiente
 cp .env.example .env
+# Editar .env com suas credenciais
 ```
 
-Edite o arquivo `.env` com suas credenciais.
-
-## 🌐 Variáveis de Ambiente
+## ⚙️ Variáveis de Ambiente
 
 ```env
-GEMINI_API_KEY=sua_chave_gemini
-MONGODB_URI=sua_connection_string_mongodb
-CAKTO_CLIENT_ID=seu_client_id_cakto
-CAKTO_CLIENT_SECRET=seu_client_secret_cakto
-CAKTO_CHECKOUT_URL=sua_url_checkout_cakto
+# MongoDB
+MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/database
+
+# JWT
+JWT_SECRET=your_jwt_secret_key
+
+# Encryption (AES-256)
+ENCRYPTION_KEY=your_32_character_encryption_key
+
+# Cakto Payment Gateway
+CAKTO_CLIENT_ID=your_cakto_client_id
+CAKTO_CLIENT_SECRET=your_cakto_client_secret
+CAKTO_CHECKOUT_URL=https://checkout.cakto.com.br/your_checkout
+
+# Google Gemini AI
+GEMINI_API_KEY=your_gemini_api_key
+
+# Server
 PORT=3001
+NODE_ENV=development
 ```
 
-## ▶️ Executar
+## 🏃 Executar
 
-### Desenvolvimento
 ```bash
+# Desenvolvimento (com hot reload)
+npm run dev
+
+# Produção
 npm start
 ```
 
-### Produção
-```bash
-NODE_ENV=production npm start
-```
+## 📊 Estrutura do Banco de Dados
 
-## 📡 Endpoints Principais
+### Models (Mongoose)
+
+- **User** - Usuários do sistema (com criptografia)
+- **Store** - Lojas
+- **StoreUser** - Relacionamento multi-store
+- **Product** - Produtos
+- **Transaction** - Transações financeiras
+- **Customer** - Clientes (CRM + Crediário)
+- **ServiceOrder** - Ordens de Serviço
+- **Supplier** - Fornecedores
+- **BankAccount** - Contas Bancárias
+- **CashClosing** - Fechamentos de Caixa
+- **Invoice** - Faturas de Assinatura
+
+## 🔐 Segurança
+
+- **Criptografia AES-256** para campos sensíveis (CPF, telefone)
+- **Blind Indexes** para busca sem descriptografar
+- **Senhas** com bcrypt (hash + salt)
+- **JWT** para autenticação stateless
+- **Middleware** de autenticação em rotas protegidas
+
+## 📡 API Endpoints
 
 ### Autenticação
-- `POST /api/users` - Criar usuário
-- `POST /api/login` - Login
+- `POST /api/auth/google-register` - Registro via Google OAuth
+- `POST /api/auth/google` - Login via Google OAuth
+- `POST /api/login` - Login tradicional
+- `POST /api/users` - Registro tradicional
 
-### Lojas
-- `GET /api/stores` - Listar lojas
-- `POST /api/stores` - Criar loja
+### Usuários
+- `GET /api/users/:id/stores` - Listar lojas do usuário
+- `PUT /api/users/:id` - Atualizar usuário
+- `PUT /api/users/:userId/active-store` - Trocar loja ativa
+- `POST /api/users/hire` - Contratar funcionário
+- `DELETE /api/stores/:storeId/users/:userId` - Remover funcionário
+- `GET /api/stores/:storeId/team` - Listar equipe
 
 ### Produtos
-- `GET /api/products` - Listar produtos
-- `POST /api/products` - Criar produto
+- `GET /api/stores/:storeId/products`
+- `POST /api/stores/:storeId/products`
+- `PUT /api/products/:id`
+- `DELETE /api/products/:id`
 
-### Pagamentos (CAKTO)
-- `POST /api/webhooks/cakto` - Webhook CAKTO
-- `POST /api/users/:id/activate-subscription` - Ativar assinatura
+### Transações
+- `GET /api/stores/:storeId/transactions`
+- `POST /api/stores/:storeId/transactions`
+- `PUT /api/transactions/:id`
+- `DELETE /api/transactions/:id`
 
-### IA (Gemini)
-- `POST /api/gemini/chat` - Chat com IA
+### Clientes
+- `GET /api/stores/:storeId/customers`
+- `POST /api/stores/:storeId/customers`
+- `PUT /api/customers/:id`
+- `DELETE /api/customers/:id`
 
-## 🔐 Webhook CAKTO
+### Ordens de Serviço
+- `GET /api/stores/:storeId/service-orders`
+- `POST /api/stores/:storeId/service-orders`
+- `PUT /api/service-orders/:id`
+- `DELETE /api/service-orders/:id`
 
-Configure o webhook no painel CAKTO:
+### Fornecedores
+- `GET /api/stores/:storeId/suppliers`
+- `POST /api/stores/:storeId/suppliers`
+- `PUT /api/suppliers/:id`
+- `DELETE /api/suppliers/:id`
 
-**URL**: `https://seu-dominio.com/api/webhooks/cakto`
+### Contas Bancárias
+- `GET /api/stores/:storeId/bank-accounts`
+- `POST /api/stores/:storeId/bank-accounts`
+- `PUT /api/bank-accounts/:id`
+- `DELETE /api/bank-accounts/:id`
 
-**Evento**: Compra aprovada (`purchase_approved`)
+### Fechamentos
+- `GET /api/stores/:storeId/cash-closings`
+- `POST /api/stores/:storeId/cash-closings`
+- `DELETE /api/cash-closings/:id`
 
-## 🚢 Deploy
+### Faturas
+- `GET /api/invoices`
+- `POST /api/invoices`
+
+### Pagamentos (Cakto)
+- `POST /api/cakto/create-checkout`
+- `POST /api/cakto/webhook`
+
+## 🚀 Deploy
 
 ### Render.com
 
-1. Crie novo Web Service
-2. Conecte este repositório
-3. Configure variáveis de ambiente
-4. Deploy automático!
+1. Criar novo Web Service
+2. Conectar repositório GitHub
+3. Configurar:
+   - **Build Command**: `npm install`
+   - **Start Command**: `npm start`
+4. Adicionar variáveis de ambiente
+5. Deploy!
 
-### Outras Plataformas
+### MongoDB Atlas
 
-- Heroku
-- Railway
-- Fly.io
-- DigitalOcean App Platform
+1. Criar cluster gratuito
+2. Configurar IP whitelist (0.0.0.0/0 para acesso público)
+3. Criar database user
+4. Copiar connection string
+5. Adicionar ao `.env` como `MONGODB_URI`
 
 ## 📝 Licença
 
-Propriedade de Nexus Dev System
+Proprietary - Todos os direitos reservados
 
-## 👥 Autores
+## 🤝 Suporte
 
-- Nexus Dev System
+Para suporte, entre em contato via email ou abra uma issue no repositório.

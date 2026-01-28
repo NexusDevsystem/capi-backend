@@ -1,0 +1,1247 @@
+import express from 'express';
+import cors from 'cors';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+import bcrypt from 'bcryptjs';
+import mongoose from 'mongoose';
+import session from 'express-session';
+import passport from './config/passport.js';
+
+// Database
+import connectDB from './config/database.js';
+
+// Models
+import User from './models/User.js';
+import Store from './models/Store.js';
+import StoreUser from './models/StoreUser.js';
+import Product from './models/Product.js';
+import Transaction from './models/Transaction.js';
+import Customer from './models/Customer.js';
+import ServiceOrder from './models/ServiceOrder.js';
+import Supplier from './models/Supplier.js';
+import BankAccount from './models/BankAccount.js';
+import CashClosing from './models/CashClosing.js';
+import Invoice from './models/Invoice.js';
+
+// Middleware & Utils
+import { authMiddleware, generateToken } from './middleware/auth.js';
+import { encrypt, decrypt, hashField } from './utils/encryption.js';
+
+dotenv.config();
+
+// Check for Fetch API (Node 18+ has it built-in)
+if (!globalThis.fetch) {
+    console.warn("⚠️  Aviso: Sua versão do Node.js é antiga. Para o backend funcionar corretamente, use Node 18+.");
+}
+
+const app = express();
+const port = process.env.PORT || 3001;
+
+// Connect to MongoDB
+connectDB();
+
+// --- CONFIGURAÇÃO CAKTO (PAYMENT GATEWAY) ---
+const CAKTO_CLIENT_ID = process.env.CAKTO_CLIENT_ID;
+const CAKTO_CLIENT_SECRET = process.env.CAKTO_CLIENT_SECRET;
+const CAKTO_CHECKOUT_URL = process.env.CAKTO_CHECKOUT_URL;
+const CAKTO_BASE_URL = "https://api.cakto.com.br";
+
+// Cache do token CAKTO (evita requisições desnecessárias)
+let caktoTokenCache = { token: null, expiresAt: 0 };
+
+/**
+ * Obtém token de acesso CAKTO via OAuth2
+ */
+async function getCaktoAccessToken() {
+    if (caktoTokenCache.token && Date.now() < caktoTokenCache.expiresAt) {
+        return caktoTokenCache.token;
+    }
+
+    try {
+        const response = await fetch(`${CAKTO_BASE_URL}/oauth/token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                client_id: CAKTO_CLIENT_ID,
+                client_secret: CAKTO_CLIENT_SECRET,
+                grant_type: 'client_credentials'
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`CAKTO OAuth failed: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        caktoTokenCache = {
+            token: data.access_token,
+            expiresAt: Date.now() + (55 * 60 * 1000)
+        };
+
+        return data.access_token;
+    } catch (error) {
+        console.error('Erro ao obter token CAKTO:', error);
+        throw error;
+    }
+}
+
+// --- VALIDATORS ---
+const isValidCNPJ = (cnpj) => {
+    if (!cnpj) return false;
+    cnpj = cnpj.replace(/[^\d]+/g, '');
+    if (cnpj === '') return false;
+    if (cnpj.length !== 14) return false;
+    if (/^(\d)\1+$/.test(cnpj)) return false;
+
+    let tamanho = cnpj.length - 2
+    let numeros = cnpj.substring(0, tamanho);
+    let digitos = cnpj.substring(tamanho);
+    let soma = 0;
+    let pos = tamanho - 7;
+    for (let i = tamanho; i >= 1; i--) {
+        soma += parseInt(numeros.charAt(tamanho - i)) * pos--;
+        if (pos < 2) pos = 9;
+    }
+    let resultado = soma % 11 < 2 ? 0 : 11 - soma % 11;
+    if (resultado !== parseInt(digitos.charAt(0))) return false;
+
+    tamanho = tamanho + 1;
+    numeros = cnpj.substring(0, tamanho);
+    soma = 0;
+    pos = tamanho - 7;
+    for (let i = tamanho; i >= 1; i--) {
+        soma += parseInt(numeros.charAt(tamanho - i)) * pos--;
+        if (pos < 2) pos = 9;
+    }
+    resultado = soma % 11 < 2 ? 0 : 11 - soma % 11;
+    if (resultado !== parseInt(digitos.charAt(1))) return false;
+    return true;
+};
+
+const isStrongPassword = (pass) => {
+    return pass && pass.length >= 8 && /\d/.test(pass) && /[a-zA-Z]/.test(pass);
+};
+
+const isValidPhone = (phone) => {
+    if (!phone) return false;
+    const p = phone.replace(/\D/g, '');
+    return p.length >= 10 && p.length <= 11;
+};
+
+const isValidCPF = (cpf) => {
+    if (!cpf) return false;
+    cpf = cpf.replace(/[^\d]+/g, '');
+    if (cpf.length !== 11 || /^(\d)\1+$/.test(cpf)) return false;
+    let soma = 0, resto;
+    for (let i = 1; i <= 9; i++) soma = soma + parseInt(cpf.substring(i - 1, i)) * (11 - i);
+    resto = (soma * 10) % 11;
+    if ((resto === 10) || (resto === 11)) resto = 0;
+    if (resto !== parseInt(cpf.substring(9, 10))) return false;
+    soma = 0;
+    for (let i = 1; i <= 10; i++) soma = soma + parseInt(cpf.substring(i - 1, i)) * (12 - i);
+    resto = (soma * 10) % 11;
+    if ((resto === 10) || (resto === 11)) resto = 0;
+    if (resto !== parseInt(cpf.substring(10, 11))) return false;
+    return true;
+};
+
+// Middleware
+app.use(cors({
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    credentials: true
+}));
+app.use(bodyParser.json({ limit: '50mb' }));
+app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+
+// Session configuration
+app.use(session({
+    secret: process.env.SESSION_SECRET || 'capi-session-secret-change-in-production',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        httpOnly: true,
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    }
+}));
+
+// Initialize Passport
+app.use(passport.initialize());
+app.use(passport.session());
+
+// Health Check Endpoint
+app.get('/api/health', async (req, res) => {
+    try {
+        const dbState = mongoose.connection.readyState;
+        const states = ['disconnected', 'connected', 'connecting', 'disconnecting'];
+
+        res.json({
+            status: dbState === 1 ? 'ok' : 'error',
+            database: states[dbState],
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            status: 'error',
+            database: 'disconnected',
+            error: error.message
+        });
+    }
+});
+
+// ============================================
+// GOOGLE OAUTH ROUTES
+// ============================================
+
+// Initiate Google OAuth flow
+app.get('/api/auth/google',
+    passport.authenticate('google', { scope: ['profile', 'email'] })
+);
+
+// Google OAuth callback
+app.get('/api/auth/google/callback',
+    passport.authenticate('google', { failureRedirect: '/login' }),
+    async (req, res) => {
+        try {
+            // Check if new user
+            if (req.user.isNewUser) {
+                // Redirect to frontend registration page with Google data
+                const googleData = encodeURIComponent(JSON.stringify(req.user.googleData));
+                return res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/register?google=${googleData}`);
+            }
+
+            // Existing user - fetch stores and generate token
+            const user = req.user;
+            const storeAssociations = await StoreUser.find({ userId: user._id }).populate('storeId');
+
+            const userResponse = user.toJSON();
+
+            // SANITIZATION: Remove large base64 images to prevent Header Too Large (HTTP 431)
+            if (userResponse.avatarUrl && userResponse.avatarUrl.length > 1000) {
+                userResponse.avatarUrl = null;
+            }
+
+            if (storeAssociations.length > 0) {
+                userResponse.stores = storeAssociations.map(sa => ({
+                    storeId: sa.storeId._id,
+                    storeName: sa.storeId.name,
+                    storeLogo: (sa.storeId.logoUrl && sa.storeId.logoUrl.length > 1000) ? null : sa.storeId.logoUrl,
+                    role: sa.role,
+                    isOpen: sa.storeId.isOpen || false,
+                    joinedAt: sa.joinedAt,
+                    permissions: sa.permissions || []
+                }));
+                userResponse.activeStoreId = storeAssociations[0].storeId._id;
+                userResponse.ownedStores = storeAssociations
+                    .filter(sa => sa.role === 'owner')
+                    .map(sa => sa.storeId._id);
+            }
+
+            const token = generateToken(user);
+
+            // Redirect to frontend with token and user data
+            const userData = encodeURIComponent(JSON.stringify({ ...userResponse, token }));
+            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/auth/callback?data=${userData}`);
+
+        } catch (error) {
+            console.error('[OAuth Callback] Error:', error);
+            res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:5173'}/login?error=auth_failed`);
+        }
+    }
+);
+
+// Logout
+app.get('/api/auth/logout', (req, res) => {
+    req.logout((err) => {
+        if (err) {
+            return res.status(500).json({ status: 'error', message: 'Logout failed' });
+        }
+        res.json({ status: 'success', message: 'Logged out successfully' });
+    });
+});
+
+// ============================================
+// AI ROUTES
+// ============================================
+import aiRoutes from './routes/ai.js';
+app.use('/api/ai', aiRoutes);
+
+// ============================================
+// AUTHENTICATION ROUTES
+// ============================================
+
+// --- GOOGLE AUTH REGISTER ---
+app.post('/api/auth/google-register', async (req, res) => {
+    try {
+        const { googleData, registerData, role } = req.body;
+        console.log("📝 Google Register Request:", { googleData, registerData, role });
+
+        if (!googleData || !googleData.email || !googleData.googleId) {
+            return res.status(400).json({ status: 'error', message: 'Dados do Google inválidos.' });
+        }
+        if (!registerData || !registerData.storeName || !registerData.taxId) {
+            return res.status(400).json({ status: 'error', message: 'Dados de cadastro incompletos.' });
+        }
+
+        // 1. Validar duplicidade de usuário (Email ou CPF)
+        const existingEmail = await User.findOne({ email: googleData.email });
+        if (existingEmail) {
+            return res.status(400).json({ status: 'error', message: 'Email já cadastrado.' });
+        }
+
+        // Check CPF if provided
+        if (registerData.taxId) {
+            const tHash = hashField(registerData.taxId);
+            const existingTax = await User.findOne({ taxIdHash: tHash });
+            if (existingTax) {
+                return res.status(400).json({ status: 'error', message: 'CPF já cadastrado.' });
+            }
+        }
+
+        // 2. Criar Usuário e Loja em Transação
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        try {
+            const now = new Date();
+            const trialEnd = new Date();
+            trialEnd.setDate(now.getDate() + 2);
+
+            // A. Criar Usuário Owner
+            const newUser = new User({
+                name: registerData.ownerName || googleData.name,
+                email: googleData.email,
+                password: await bcrypt.hash(Math.random().toString(36), 10),
+                phone: registerData.phone ? encrypt(registerData.phone) : null,
+                taxId: registerData.taxId ? encrypt(registerData.taxId) : null,
+                phoneHash: registerData.phone ? hashField(registerData.phone) : null,
+                taxIdHash: registerData.taxId ? hashField(registerData.taxId) : null,
+                role: 'Proprietário',
+                avatarUrl: googleData.photoUrl,
+                googleId: googleData.googleId,
+                status: 'Ativo',
+                subscriptionStatus: 'TRIAL',
+                trialEndsAt: trialEnd,
+                memberSince: now
+            });
+            await newUser.save({ session });
+
+            // B. Criar Loja
+            const newStore = new Store({
+                name: registerData.storeName,
+                ownerId: newUser._id,
+                logoUrl: registerData.logoUrl || null
+            });
+            await newStore.save({ session });
+
+            // C. Atualizar Usuário com ActiveStoreId
+            newUser.activeStoreId = newStore._id;
+            await newUser.save({ session });
+
+            // D. Criar StoreUser relation
+            const storeUser = new StoreUser({
+                userId: newUser._id,
+                storeId: newStore._id,
+                role: 'owner',
+                permissions: ['all']
+            });
+            await storeUser.save({ session });
+
+            await session.commitTransaction();
+
+            // 3. Gerar Token e Retornar
+            const userFormatted = newUser.toJSON();
+            const token = generateToken(newUser);
+
+            console.log("✅ Google Register Success:", userFormatted.email);
+            res.status(201).json({
+                status: 'success',
+                data: {
+                    user: userFormatted,
+                    token,
+                    store: newStore.toObject()
+                }
+            });
+
+        } catch (error) {
+            await session.abortTransaction();
+            throw error;
+        } finally {
+            session.endSession();
+        }
+
+    } catch (error) {
+        console.error('❌ Erro no Google Register:', error);
+        res.status(500).json({ status: 'error', message: 'Erro interno ao realizar cadastro.' });
+    }
+});
+
+// --- GOOGLE AUTH (Check & Login) ---
+app.post('/api/auth/google', async (req, res) => {
+    try {
+        const { email, name, photoUrl, googleId } = req.body;
+        console.log(`[AUTH] Google Login attempt: ${email}`);
+
+        if (!email) {
+            return res.status(400).json({ status: 'error', message: 'Email é obrigatório.' });
+        }
+
+        let user = await User.findOne({ email });
+        console.log(`[AUTH] User lookup result:`, user ? `Found user ID: ${user._id}, Status: ${user.status}` : 'NOT FOUND');
+
+        if (user) {
+            // Login existing user
+            console.log(`[AUTH] Google User found: ${user.email} (Status: ${user.status})`);
+
+            // Link Google ID if missing
+            if (googleId && !user.googleId) {
+                user.googleId = googleId;
+                await user.save();
+            }
+
+            // Check if user has store associations
+            const storeAssociations = await StoreUser.find({ userId: user._id }).populate('storeId');
+
+            // If user was PENDING and now logging in, activate them
+            if (user.status === 'Pendente' && storeAssociations.length > 0) {
+                console.log(`[AUTH] Activating pending employee: ${email}`);
+                user.status = 'Ativo';
+                user.avatarUrl = photoUrl || user.avatarUrl;
+                user.name = name || user.name;
+                await user.save();
+
+                // Update StoreUser status to Active as well
+                for (const assoc of storeAssociations) {
+                    assoc.status = 'Ativo';
+                    await assoc.save();
+                }
+            }
+
+            const token = generateToken(user);
+            const formattedUser = user.toJSON();
+
+            // Add stores info to user object
+            if (storeAssociations.length > 0) {
+                formattedUser.stores = storeAssociations.map(sa => ({
+                    storeId: sa.storeId._id,
+                    storeName: sa.storeId.name,
+                    storeLogo: sa.storeId.logoUrl,
+                    role: sa.role,
+                    isOpen: sa.storeId.isOpen || false,
+                    joinedAt: sa.joinedAt,
+                    permissions: sa.permissions || []
+                }));
+                formattedUser.activeStoreId = storeAssociations[0].storeId._id;
+                formattedUser.ownedStores = storeAssociations
+                    .filter(sa => sa.role === 'owner')
+                    .map(sa => sa.storeId._id);
+            }
+
+            return res.json({ status: 'success', data: { ...formattedUser, token } });
+        } else {
+            // DO NOT CREATE - Return New User Status
+            console.log(`[AUTH] New Google User identified: ${email}`);
+
+            return res.json({
+                status: 'new_user',
+                googleData: { email, name, photoUrl, googleId }
+            });
+        }
+    } catch (error) {
+        console.error('❌ Google Auth Error:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao autenticar com Google.', details: error.message });
+    }
+});
+
+// --- TRADITIONAL LOGIN ---
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        // 1. Find user by email
+        const user = await User.findOne({ email });
+
+        if (!user) {
+            return res.status(401).json({ status: 'error', message: 'Email ou senha incorretos.' });
+        }
+
+        // 2. Password Check
+        const isMatch = await user.comparePassword(password);
+
+        if (!isMatch) {
+            return res.status(401).json({ status: 'error', message: 'Email ou senha incorretos.' });
+        }
+
+        // Auto-migrate legacy plain text passwords
+        if (!user.password.startsWith('$2')) {
+            user.password = await bcrypt.hash(password, 10);
+            await user.save();
+            console.log(`[Security] Migrated legacy password for user ${user.email}`);
+        }
+
+        // --- VERIFICAR EXPIRAÇÃO DO TRIAL ---
+        if (user.subscriptionStatus === 'TRIAL' && user.trialEndsAt) {
+            const now = new Date();
+            if (now > user.trialEndsAt) {
+                user.subscriptionStatus = 'PENDING';
+                await user.save();
+            }
+        }
+
+        const userResponse = user.toJSON();
+        const token = generateToken(user);
+
+        res.json({ status: 'success', data: { ...userResponse, token } });
+    } catch (error) {
+        console.error('Erro no login:', error);
+        res.status(500).json({ status: 'error', message: 'Erro interno no login.' });
+    }
+});
+
+// --- REGISTER USER (Traditional) ---
+app.post('/api/users', async (req, res) => {
+    try {
+        const { name, email, password, phone, taxId, role, storeId, avatarUrl, status, googleId } = req.body;
+
+        // Validação básica
+        if (!name || !email || !password) {
+            return res.status(400).json({ status: 'error', message: 'Dados obrigatórios faltando.' });
+        }
+
+        // Validação extra se for Dono
+        if (role === 'Proprietário') {
+            if (!isValidCNPJ(taxId) && !isValidCPF(taxId)) {
+                return res.status(400).json({ status: 'error', message: 'CPF ou CNPJ inválido ou ausente.' });
+            }
+            if (!isValidPhone(phone)) {
+                return res.status(400).json({ status: 'error', message: 'Telefone inválido.' });
+            }
+        }
+
+        // Verificar se usuário já existe
+        const pHash = phone ? hashField(phone) : null;
+        const tHash = taxId ? hashField(taxId) : null;
+
+        const existingUser = await User.findOne({
+            $or: [
+                { email },
+                ...(pHash ? [{ phoneHash: pHash }] : []),
+                ...(tHash ? [{ taxIdHash: tHash }] : [])
+            ]
+        });
+
+        if (existingUser) {
+            let msg = 'Usuário já cadastrado.';
+            if (existingUser.email === email) msg = 'Email já cadastrado.';
+            else if (existingUser.phoneHash === pHash) msg = 'Telefone já cadastrado.';
+            else if (existingUser.taxIdHash === tHash) msg = 'CNPJ/CPF já cadastrado.';
+
+            return res.status(400).json({ status: 'error', message: msg });
+        }
+
+        // --- LÓGICA DE TRIAL DE 2 DIAS ---
+        const now = new Date();
+        const trialEnd = new Date();
+        trialEnd.setDate(now.getDate() + 2);
+
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const encryptedPhone = phone ? encrypt(phone) : null;
+        const encryptedTaxId = taxId ? encrypt(taxId) : null;
+
+        const newUser = new User({
+            name,
+            email,
+            password: hashedPassword,
+            phone: encryptedPhone,
+            taxId: encryptedTaxId,
+            phoneHash: pHash,
+            taxIdHash: tHash,
+            role: role || 'user',
+            activeStoreId: storeId,
+            avatarUrl,
+            googleId,
+            status: status || 'Pendente',
+            subscriptionStatus: 'TRIAL',
+            trialEndsAt: trialEnd,
+            memberSince: now,
+            nextBillingAt: trialEnd
+        });
+
+        await newUser.save();
+
+        const userResponse = newUser.toJSON();
+        const token = generateToken(newUser);
+
+        res.status(201).json({ status: 'success', data: { ...userResponse, token } });
+    } catch (error) {
+        console.error('Erro ao criar usuário:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao criar usuário.' });
+    }
+});
+
+// ============================================
+// USER ROUTES
+// ============================================
+
+// Get User Stores - Returns all stores the user has access to
+app.get('/api/users/:id/stores', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // 1. Check user existence
+        const user = await User.findById(id);
+        if (!user) {
+            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
+        }
+
+        // 2. Get Owned Stores
+        const ownedStoresList = await Store.find({ ownerId: id });
+
+        const ownedStoresFormatted = ownedStoresList.map(store => ({
+            storeId: store._id,
+            storeName: store.name,
+            storeLogo: store.logoUrl,
+            role: 'owner',
+            isOpen: store.isOpen || false,
+            joinedAt: store.createdAt,
+            permissions: ['all']
+        }));
+
+        // 3. Get Membership Stores (StoreUser)
+        const memberships = await StoreUser.find({ userId: id }).populate('storeId');
+
+        const memberStoresFormatted = memberships.map(su => ({
+            storeId: su.storeId._id,
+            storeName: su.storeId.name,
+            storeLogo: su.storeId.logoUrl,
+            role: su.role,
+            isOpen: su.storeId.isOpen || false,
+            joinedAt: su.joinedAt,
+            permissions: su.permissions || []
+        }));
+
+        // Combine and deduplicate stores
+        const allStores = [...ownedStoresFormatted, ...memberStoresFormatted];
+        const uniqueStores = allStores.reduce((acc, store) => {
+            if (!acc.find(s => s.storeId.toString() === store.storeId.toString())) {
+                acc.push(store);
+            }
+            return acc;
+        }, []);
+
+        res.json({
+            status: 'success',
+            data: {
+                stores: uniqueStores,
+                ownedStores: ownedStoresFormatted,
+                activeStoreId: user.activeStoreId || (uniqueStores[0]?.storeId || null)
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Erro ao buscar lojas do usuário:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar lojas.' });
+    }
+});
+
+// Update User (Generic) - PROTECTED
+app.put('/api/users/:id', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = req.body;
+
+        // AUTH CHECK: Ensure user is updating themselves or is admin
+        if (req.user.id !== id && req.user.role !== 'admin') {
+            return res.status(403).json({ status: 'error', message: 'Sem permissão para alterar este usuário.' });
+        }
+
+        // SECURITY: Block direct updates to sensitive fields
+        const blockedFields = ['subscriptionStatus', 'trialEndsAt', 'nextBillingAt', 'password'];
+        const hasBlockedField = blockedFields.some(field => field in updates);
+
+        if (hasBlockedField) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Não é permitido atualizar campos de assinatura diretamente. Use o endpoint apropriado.'
+            });
+        }
+
+        const user = await User.findByIdAndUpdate(id, updates, { new: true });
+        res.json({ status: 'success', data: user.toJSON() });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar usuário.' });
+    }
+});
+
+// Switch Active Store - PROTECTED
+app.put('/api/users/:userId/active-store', authMiddleware, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { storeId } = req.body;
+
+        if (req.user.id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized action' });
+        }
+
+        if (!storeId) {
+            return res.status(400).json({ status: 'error', message: 'Store ID required' });
+        }
+
+        // Verify if user is member of this store
+        const membership = await StoreUser.findOne({ userId, storeId });
+
+        if (!membership) {
+            return res.status(403).json({ status: 'error', message: 'User is not a member of this store' });
+        }
+
+        // Update active store
+        const user = await User.findByIdAndUpdate(userId, { activeStoreId: storeId }, { new: true });
+
+        if (!user) {
+            return res.status(404).json({ status: 'error', message: 'User not found' });
+        }
+
+        res.json({
+            status: 'success',
+            data: user.toJSON(),
+            message: 'Active store updated'
+        });
+    } catch (error) {
+        console.error('Error switching active store:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to switch active store' });
+    }
+});
+
+// Hire Employee
+app.post('/api/users/hire', async (req, res) => {
+    try {
+        const { storeId, email, role, phone, salary, commission } = req.body;
+        if (!email || !storeId) return res.status(400).json({ status: 'error', message: 'Email e Loja são obrigatórios.' });
+
+        console.log(`[API] Hiring employee ${email} for store ${storeId} as ${role}`);
+
+        // 1. Check if user exists
+        let user = await User.findOne({ email });
+
+        if (!user) {
+            console.log(`[API] User not found. Creating PENDING user for invites.`);
+            const password = await bcrypt.hash(Math.random().toString(36) + Date.now().toString(), 10);
+
+            const encryptedPhone = phone ? encrypt(phone) : null;
+            const pHash = phone ? hashField(phone) : null;
+
+            user = new User({
+                name: email.split('@')[0],
+                email,
+                password,
+                phone: encryptedPhone,
+                phoneHash: pHash,
+                role: 'Vendedor',
+                status: 'Pendente',
+                subscriptionStatus: 'FREE'
+            });
+            await user.save();
+        } else {
+            // Update existing user phone if provided and missing
+            if (phone && !user.phone) {
+                user.phone = encrypt(phone);
+                user.phoneHash = hashField(phone);
+                await user.save();
+            }
+        }
+
+        // 2. Check if already in store
+        const existingMember = await StoreUser.findOne({ userId: user._id, storeId });
+
+        if (existingMember) {
+            return res.status(400).json({ status: 'error', message: 'Usuário já faz parte da equipe.' });
+        }
+
+        // 3. Add to Store
+        const storeUser = new StoreUser({
+            userId: user._id,
+            storeId,
+            role: role || 'Vendedor',
+            status: user.status === 'Pendente' ? 'Pendente' : 'Ativo',
+            salary: salary ? parseFloat(salary) : null,
+            commission: commission ? parseFloat(commission) : null
+        });
+        await storeUser.save();
+
+        console.log(`[API] Employee hired successfully: ${email}`);
+        res.json({ status: 'success', message: 'Convite enviado. Usuário adicionado à equipe.' });
+
+    } catch (error) {
+        console.error('Erro ao contratar:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao processar contratação.' });
+    }
+});
+
+// Remove Employee from Store
+app.delete('/api/stores/:storeId/users/:userId', async (req, res) => {
+    try {
+        const { storeId, userId } = req.params;
+
+        console.log(`[API] Removing employee ${userId} from store ${storeId}`);
+
+        const storeUser = await StoreUser.findOne({ userId, storeId });
+
+        if (!storeUser) {
+            console.log('[API] StoreUser not found!');
+            return res.status(404).json({ status: 'error', message: 'Colaborador não encontrado nesta loja.' });
+        }
+
+        await StoreUser.deleteOne({ userId, storeId });
+
+        console.log(`[API] Employee ${userId} removed from store ${storeId} successfully`);
+        res.json({ status: 'success', message: 'Colaborador removido da equipe.' });
+
+    } catch (error) {
+        console.error('[API] Erro ao remover colaborador:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao remover colaborador.' });
+    }
+});
+
+// Get Store Team
+app.get('/api/stores/:storeId/team', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const teamMembers = await StoreUser.find({ storeId }).populate('userId');
+
+        const team = teamMembers.map(member => ({
+            ...member.userId.toJSON(),
+            role: member.role,
+            joinedAt: member.joinedAt
+        }));
+
+        res.json({ status: 'success', data: team });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar time.' });
+    }
+});
+
+// ============================================
+// STORE DATA ROUTES (Products, Transactions, etc)
+// ============================================
+
+// --- PRODUCTS ---
+app.get('/api/stores/:storeId/products', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const products = await Product.find({ storeId });
+        res.json({ status: 'success', data: products });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar produtos.' });
+    }
+});
+
+app.post('/api/stores/:storeId/products', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const productData = { ...req.body, storeId };
+        const product = new Product(productData);
+        await product.save();
+        res.status(201).json({ status: 'success', data: product });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar produto.' });
+    }
+});
+
+app.put('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const product = await Product.findByIdAndUpdate(id, req.body, { new: true });
+        if (!product) return res.status(404).json({ status: 'error', message: 'Produto não encontrado.' });
+        res.json({ status: 'success', data: product });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar produto.' });
+    }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await Product.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Produto deletado.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar produto.' });
+    }
+});
+
+// --- TRANSACTIONS ---
+app.get('/api/stores/:storeId/transactions', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const transactions = await Transaction.find({ storeId }).sort({ date: -1 });
+        res.json({ status: 'success', data: transactions });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar transações.' });
+    }
+});
+
+app.post('/api/stores/:storeId/transactions', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const txData = { ...req.body, storeId };
+        const transaction = new Transaction(txData);
+        await transaction.save();
+        res.status(201).json({ status: 'success', data: transaction });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar transação.' });
+    }
+});
+
+app.put('/api/transactions/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const transaction = await Transaction.findByIdAndUpdate(id, req.body, { new: true });
+        if (!transaction) return res.status(404).json({ status: 'error', message: 'Transação não encontrada.' });
+        res.json({ status: 'success', data: transaction });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar transação.' });
+    }
+});
+
+app.delete('/api/transactions/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await Transaction.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Transação deletada.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar transação.' });
+    }
+});
+
+// --- CUSTOMERS ---
+app.get('/api/stores/:storeId/customers', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const customers = await Customer.find({ storeId });
+        res.json({ status: 'success', data: customers });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar clientes.' });
+    }
+});
+
+app.post('/api/stores/:storeId/customers', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const customerData = { ...req.body, storeId };
+
+        // Encrypt phone if provided
+        if (customerData.phone) {
+            customerData.phone = encrypt(customerData.phone);
+            customerData.phoneHash = hashField(req.body.phone);
+        }
+
+        const customer = new Customer(customerData);
+        await customer.save();
+        res.status(201).json({ status: 'success', data: customer });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar cliente.' });
+    }
+});
+
+app.put('/api/customers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = { ...req.body };
+
+        // Encrypt phone if being updated
+        if (updates.phone && !updates.phone.includes(':')) { // Not already encrypted
+            updates.phone = encrypt(updates.phone);
+            updates.phoneHash = hashField(req.body.phone);
+        }
+
+        const customer = await Customer.findByIdAndUpdate(id, updates, { new: true });
+        if (!customer) return res.status(404).json({ status: 'error', message: 'Cliente não encontrado.' });
+        res.json({ status: 'success', data: customer });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar cliente.' });
+    }
+});
+
+app.delete('/api/customers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await Customer.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Cliente deletado.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar cliente.' });
+    }
+});
+
+// --- SERVICE ORDERS ---
+app.get('/api/stores/:storeId/service-orders', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const orders = await ServiceOrder.find({ storeId }).sort({ openDate: -1 });
+        res.json({ status: 'success', data: orders });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar ordens de serviço.' });
+    }
+});
+
+app.post('/api/stores/:storeId/service-orders', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const orderData = { ...req.body, storeId };
+        const order = new ServiceOrder(orderData);
+        await order.save();
+        res.status(201).json({ status: 'success', data: order });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar ordem de serviço.' });
+    }
+});
+
+app.put('/api/service-orders/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const order = await ServiceOrder.findByIdAndUpdate(id, req.body, { new: true });
+        if (!order) return res.status(404).json({ status: 'error', message: 'Ordem não encontrada.' });
+        res.json({ status: 'success', data: order });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar ordem.' });
+    }
+});
+
+app.delete('/api/service-orders/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await ServiceOrder.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Ordem deletada.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar ordem.' });
+    }
+});
+
+// --- SUPPLIERS ---
+app.get('/api/stores/:storeId/suppliers', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const suppliers = await Supplier.find({ storeId });
+        res.json({ status: 'success', data: suppliers });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar fornecedores.' });
+    }
+});
+
+app.post('/api/stores/:storeId/suppliers', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const supplierData = { ...req.body, storeId };
+
+        if (supplierData.phone) {
+            supplierData.phone = encrypt(supplierData.phone);
+            supplierData.phoneHash = hashField(req.body.phone);
+        }
+
+        const supplier = new Supplier(supplierData);
+        await supplier.save();
+        res.status(201).json({ status: 'success', data: supplier });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar fornecedor.' });
+    }
+});
+
+app.put('/api/suppliers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = { ...req.body };
+
+        if (updates.phone && !updates.phone.includes(':')) {
+            updates.phone = encrypt(updates.phone);
+            updates.phoneHash = hashField(req.body.phone);
+        }
+
+        const supplier = await Supplier.findByIdAndUpdate(id, updates, { new: true });
+        if (!supplier) return res.status(404).json({ status: 'error', message: 'Fornecedor não encontrado.' });
+        res.json({ status: 'success', data: supplier });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar fornecedor.' });
+    }
+});
+
+app.delete('/api/suppliers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await Supplier.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Fornecedor deletado.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar fornecedor.' });
+    }
+});
+
+// --- BANK ACCOUNTS ---
+app.get('/api/stores/:storeId/bank-accounts', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const accounts = await BankAccount.find({ storeId });
+        res.json({ status: 'success', data: accounts });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar contas bancárias.' });
+    }
+});
+
+app.post('/api/stores/:storeId/bank-accounts', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const accountData = { ...req.body, storeId };
+        const account = new BankAccount(accountData);
+        await account.save();
+        res.status(201).json({ status: 'success', data: account });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar conta bancária.' });
+    }
+});
+
+app.put('/api/bank-accounts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const account = await BankAccount.findByIdAndUpdate(id, req.body, { new: true });
+        if (!account) return res.status(404).json({ status: 'error', message: 'Conta não encontrada.' });
+        res.json({ status: 'success', data: account });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao atualizar conta.' });
+    }
+});
+
+app.delete('/api/bank-accounts/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await BankAccount.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Conta deletada.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar conta.' });
+    }
+});
+
+// --- CASH CLOSINGS ---
+app.get('/api/stores/:storeId/cash-closings', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const closings = await CashClosing.find({ storeId }).sort({ date: -1 });
+        res.json({ status: 'success', data: closings });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar fechamentos.' });
+    }
+});
+
+app.post('/api/stores/:storeId/cash-closings', async (req, res) => {
+    try {
+        const { storeId } = req.params;
+        const closingData = { ...req.body, storeId };
+        const closing = new CashClosing(closingData);
+        await closing.save();
+        res.status(201).json({ status: 'success', data: closing });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar fechamento.' });
+    }
+});
+
+app.delete('/api/cash-closings/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await CashClosing.findByIdAndDelete(id);
+        res.json({ status: 'success', message: 'Fechamento deletado.' });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao deletar fechamento.' });
+    }
+});
+
+// --- INVOICES (Subscription) ---
+app.get('/api/invoices', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const invoices = await Invoice.find({ userId }).sort({ date: -1 });
+        res.json({ status: 'success', data: invoices });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao buscar faturas.' });
+    }
+});
+
+app.post('/api/invoices', async (req, res) => {
+    try {
+        const invoiceData = req.body;
+        const invoice = new Invoice(invoiceData);
+        await invoice.save();
+        res.status(201).json({ status: 'success', data: invoice });
+    } catch (error) {
+        res.status(500).json({ status: 'error', message: 'Erro ao criar fatura.' });
+    }
+});
+
+// ============================================
+// CAKTO PAYMENT ROUTES
+// ============================================
+
+app.post('/api/cakto/create-checkout', authMiddleware, async (req, res) => {
+    try {
+        const { userId, plan } = req.body;
+
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ status: 'error', message: 'Usuário não encontrado.' });
+        }
+
+        // Return checkout URL (configured in Cakto dashboard)
+        res.json({
+            status: 'success',
+            data: {
+                checkoutUrl: CAKTO_CHECKOUT_URL,
+                userId: user._id
+            }
+        });
+    } catch (error) {
+        console.error('Erro ao criar checkout Cakto:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao criar checkout.' });
+    }
+});
+
+// Cakto Webhook (Payment Confirmation)
+app.post('/api/cakto/webhook', async (req, res) => {
+    try {
+        const { event, data } = req.body;
+
+        console.log('[CAKTO WEBHOOK]', event, data);
+
+        if (event === 'payment.approved') {
+            const { customer_email, amount } = data;
+
+            const user = await User.findOne({ email: customer_email });
+            if (user) {
+                user.subscriptionStatus = 'ACTIVE';
+                user.nextBillingAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // +30 days
+                await user.save();
+
+                // Create invoice record
+                const invoice = new Invoice({
+                    userId: user._id,
+                    date: new Date(),
+                    amount: amount / 100, // Convert cents to reais
+                    status: 'PAID',
+                    method: 'PIX'
+                });
+                await invoice.save();
+
+                console.log(`✅ Subscription activated for ${customer_email}`);
+            }
+        }
+
+        res.json({ status: 'success' });
+    } catch (error) {
+        console.error('Erro no webhook Cakto:', error);
+        res.status(500).json({ status: 'error', message: 'Erro ao processar webhook.' });
+    }
+});
+
+// ============================================
+// START SERVER
+// ============================================
+
+app.listen(port, () => {
+    console.log(`🚀 Server running on port ${port}`);
+    console.log(`📍 Environment: ${process.env.NODE_ENV}`);
+    console.log(`🔗 Health check: http://localhost:${port}/api/health`);
+});

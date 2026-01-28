@@ -1,0 +1,32 @@
+# Ignore development files
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Ignore backup and deprecated files
+*.backup
+*_deprecated/
+models_deprecated/
+server.js.mongoose.backup
+
+# Ignore logs
+*.log
+
+# Ignore test files
+*.test.js
+clean-db.js
+debug_*.js
+fix_*.js
+trigger_fix.js
+migrate-to-multistore.js
+find-working-model.js
+get-user-stores-route.js
+
+# Ignore Git
+.git/
+.gitignore
+
+# Ignore IDE
+.vscode/
+.idea/
